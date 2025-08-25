@@ -1,0 +1,41 @@
+# AWS S3 Upload
+boto3>=1.28.0
+# Production Requirements - Optimized for deployment
+# Core FastAPI
+fastapi==0.115.13
+uvicorn[standard]==0.34.3
+pydantic>=2.0.0
+pydantic-ai>=0.4.0
+starlette==0.46.2
+
+# File handling
+python-multipart==0.0.20
+aiofiles==23.2.0
+
+# HTTP requests
+requests==2.32.4
+aiohttp==3.9.5
+
+# Video processing (core)
+opencv-python==4.11.0.86
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+pillow==11.2.1
+
+# Audio processing
+
+# System utilities
+psutil==5.9.8
+filelock==3.13.1
+
+# Scientific computing (minimal)
+numpy==2.3.0
+
+# Testing & Coverage
+pytest>=8.0.0
+pytest-cov>=5.0.0
+
+# Load .env into pytest environment
+pytest-dotenv>=0.5.2
+
+# Production extras

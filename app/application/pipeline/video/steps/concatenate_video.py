@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import os
+import logging
+
+from app.application.pipeline.base import PipelineContext, BaseStep
+from app.application.interfaces.renderer import IVideoRenderer
+from app.core.exceptions import ProcessingError
+
+
+logger = logging.getLogger(__name__)
+
+
+class ConcatenateVideoStep(BaseStep):
+    name = "concatenate_video"
+    required_keys = ["segment_clips"]
+    def __init__(self, renderer: IVideoRenderer):
+        self.renderer = renderer
+
+    async def run(self, context: PipelineContext) -> None:  # type: ignore[override]
+        clips = context.get("segment_clips") or []
+        if not isinstance(clips, list):
+            raise ValueError("segment_clips must be a list")
+
+        # Normalize and validate clip paths
+        clip_paths = [c.get("path") if isinstance(c, dict) else c for c in clips]
+        clip_paths = [p for p in clip_paths if isinstance(p, str) and p]
+        if not clip_paths:
+            raise ProcessingError("No clip paths provided for concatenation")
+
+        # Ensure all inputs exist
+        missing = [p for p in clip_paths if not os.path.exists(p)]
+        if missing:
+            raise ProcessingError(f"Missing clip files for concatenation: {missing}")
+
+        video_id = context.get_run_id() or "video"
+        filename = f"final_video_{video_id}.mp4"
+        output_path = os.path.join("data", "output", filename)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # Optional transition policy (e.g., "fade", "none"), passed through to renderer
+        transition = context.get("concat_transition")
+
+        logger.info("Concatenating %d clips -> %s", len(clip_paths), output_path)
+        await self.renderer.concat_clips(
+            clip_paths, output_path=output_path, transition=transition
+        )
+
+        # Verify output exists
+        if not os.path.exists(output_path):
+            raise ProcessingError(
+                f"Concatenation reported success but output not found: {output_path}"
+            )
+        try:
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            logger.info("✅ Concatenation done: %s (%.2f MB)", output_path, size_mb)
+        except Exception:  # size is best-effort
+            logger.info("✅ Concatenation done: %s", output_path)
+        context.set("final_video_path", output_path)
+        return

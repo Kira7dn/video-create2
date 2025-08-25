@@ -1,0 +1,48 @@
+# Docker Compose với ngrok tunnel
+services:
+  # FastAPI service
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+      - CORS_ORIGINS=*
+      - GENTLE_URL=http://gentle:8765/transcriptions
+      - DEV_MODE=false
+    volumes:
+      - ./data:/app/data # Chỉ mount thư mục data, log sẽ nằm trong đây
+      - ./test:/app/test # Mount thư mục test để có thể truy cập test files
+    networks:
+      - app_network
+    mem_limit: 2g # Giới hạn bộ nhớ tối đa 2GB cho container FastAPI
+    restart: always
+
+  # Ngrok tunnel
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: http api:8000 --authtoken=${NGROK_AUTHTOKEN} --url=${NGROK_URL}
+    ports:
+      - "4040:4040"
+    depends_on:
+      - api
+    networks:
+      - app_network
+    restart: always
+
+  # Gentle Forced Aligner
+  gentle:
+    image: lowerquality/gentle:latest
+    container_name: gentle
+    ports:
+      - "8765:8765"
+    networks:
+      - app_network
+    mem_limit: 2g # Giới hạn bộ nhớ tối đa 2GB cho container Gentle
+    restart: always
+
+networks:
+  app_network:
+    driver: bridge

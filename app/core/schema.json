@@ -1,0 +1,105 @@
+{
+  "type": "object",
+  "properties": {
+    "niche": {
+      "type": "string"
+    },
+    "keywords": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "title": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "voice_over": {
+            "type": "object",
+            "properties": {
+              "url": { "type": "string" },
+              "content": { "type": "string" },
+              "start_delay": { "type": "number" },
+              "end_delay": { "type": "number" },
+              "local_path": { "type": "string" }
+            },
+            "required": ["url"]
+          },
+          "image": {
+            "type": "object",
+            "properties": {
+              "url": { "type": "string" },
+              "start_delay": { "type": "number" },
+              "end_delay": { "type": "number" },
+              "local_path": { "type": "string" }
+            },
+            "required": ["url"]
+          },
+          "video": {
+            "type": "object",
+            "properties": {
+              "url": { "type": "string" },
+              "start_delay": { "type": "number" },
+              "end_delay": { "type": "number" },
+              "local_path": { "type": "string" }
+            },
+            "required": ["url"]
+          },
+          "transition_in": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "fade",
+                  "fadeblack",
+                  "fadewhite",
+                  "cut"
+                ]
+              },
+              "duration": { "type": "number" }
+            }
+          },
+          "transition_out": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "fade",
+                  "fadeblack",
+                  "fadewhite",
+                  "cut"
+                ]
+              },
+              "duration": { "type": "number" }
+            }
+          }
+        },
+        "required": ["id"]
+      }
+    },
+    "background_music": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string" },
+        "volume": { "type": "number" },
+        "start_delay": { "type": "number" },
+        "end_delay": { "type": "number" },
+        "fade_in": { "type": "number" },
+        "fade_out": { "type": "number" },
+        "local_path": { "type": "string" }
+      },
+      "required": ["url"]
+    }
+  },
+  "required": ["segments"]
+}
