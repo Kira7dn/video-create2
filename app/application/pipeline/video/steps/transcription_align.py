@@ -6,15 +6,10 @@ from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
 from app.application.pipeline.base import PipelineContext, BaseStep
-from app.application.interfaces import ITranscriptionAligner
-
-from utils.gentle_utils import filter_successful_words
-from utils.alignment_utils import find_greedy_shift_match
-from utils.text_utils import (
-    _fallback_split,  # type: ignore
-    create_text_over_item,
-    normalize_text,
-    split_transcript,
+from app.application.interfaces import (
+    ITranscriptionAligner,
+    ITranscriptSplitter,
+    ITextOverBuilder,
 )
 
 
@@ -30,9 +25,18 @@ class TranscriptionAlignStep(BaseStep):
     - Gentle server available at http://localhost:8765/transcriptions
     """
 
-    def __init__(self, aligner: Optional[ITranscriptionAligner] = None) -> None:
+    def __init__(
+        self,
+        aligner: ITranscriptionAligner,
+        splitter: ITranscriptSplitter,
+        builder: ITextOverBuilder,
+    ) -> None:
         # Adapter for alignment (Gentle or alternative)
         self.aligner = aligner
+        # Adapter for transcript splitting (LLM or custom)
+        self.splitter = splitter
+        # Adapter for building text_over items
+        self.builder = builder
         self.logger = logging.getLogger(__name__)
 
     async def run(self, context: PipelineContext) -> None:  # type: ignore[override]
@@ -53,23 +57,17 @@ class TranscriptionAlignStep(BaseStep):
             voice = seg.get("voice_over") or {}
             content: str = (voice or {}).get("content") or ""
             audio_path: Optional[str] = (voice or {}).get("local_path")
+            seg_id = seg.get("id")
 
             # Default: no text_over
             seg_out["text_over"] = []
 
-            # Split transcript into readable chunks; prefer LLM splitter like legacy
+            # Split transcript into readable chunks via injected splitter with robust fallback
             if content:
                 try:
-                    # Use async split_transcript for better quality
-                    chunks: List[str] = await split_transcript(content)
-                    if not chunks:
-                        # fallback if LLM returns empty
-                        chunks = _fallback_split(content)
+                    chunks: List[str] = await self.splitter.split(content, seg_id)
                 except Exception:
-                    # Robust fallback
-                    chunks = _fallback_split(content)
-                    if not chunks:
-                        chunks = [content]
+                    chunks = []
             else:
                 chunks = []
 
@@ -82,10 +80,11 @@ class TranscriptionAlignStep(BaseStep):
             verify: Dict[str, Any] = {}
 
             # Try alignment if audio available
-            if audio_path and Path(audio_path).exists() and self.aligner is not None:
+            if audio_path and Path(audio_path).exists():
                 try:
                     word_items, verify = self.aligner.align(
                         audio_path=str(audio_path),
+                        words_id=seg_id,
                         transcript_text=content,
                         min_success_ratio=getattr(
                             settings, "alignment_min_success_ratio", 0.8
@@ -101,78 +100,24 @@ class TranscriptionAlignStep(BaseStep):
                         "total_words": 0,
                     }
 
-            text_over_items: List[Dict[str, Any]] = []
-            if word_items:
-                # Legacy-like grouping over normalized lines with greedy shift matching
-                success_words = filter_successful_words(word_items)
-                word_index = 0
-                cur_t = 0.0  # for synthesized items when matching fails
-                for chunk in chunks:
-                    if not chunk.strip():
-                        continue
-                    line_norm = normalize_text(chunk)
-                    if not line_norm:
-                        continue
-                    group = find_greedy_shift_match(
-                        line_norm,
-                        success_words,
-                        start_idx=word_index,
-                        max_skips_per_side=2,
-                        similarity_threshold=1.0,
+            # Build text_over items via adapter
+            text_over_items: List[Dict[str, Any]] = self.builder.build(
+                word_items=word_items,
+                chunks=chunks,
+                text_over_id=seg_id,
+            )
+
+            # Safety: if builder produced no items but we have content, synthesize fallback
+            if not text_over_items and content:
+                fallback_chunks = chunks if chunks else [content]
+                try:
+                    text_over_items = self.builder.build(
+                        word_items=[],
+                        chunks=fallback_chunks,
+                        text_over_id=seg_id,
                     )
-                    item = create_text_over_item(chunk, group)
-                    if item:
-                        text_over_items.append(item)
-                        # advance word_index to after last matched item
-                        for it in reversed(group):
-                            if it in success_words:
-                                word_index = success_words.index(it) + 1
-                                break
-                        # update cur_t to the end of this item
-                        try:
-                            cur_t = float(item["start_time"]) + float(item["duration"])  # type: ignore
-                        except Exception:
-                            pass
-                    else:
-                        # Synthesize a fallback item to preserve content
-                        wc = len(chunk.split())
-                        dur = max(
-                            getattr(settings, "text_over_min_duration", 1.0),
-                            min(
-                                getattr(settings, "text_over_max_duration", 6.0),
-                                getattr(settings, "text_over_word_seconds", 0.4) * wc,
-                            ),
-                        )
-                        text_over_items.append(
-                            {
-                                "text": chunk,
-                                "start_time": cur_t,
-                                "duration": dur,
-                                "word_count": wc,
-                            }
-                        )
-                        cur_t += dur
-            else:
-                # Fallback-only: synthesize simple timings per chunk
-                cur_t = 0.0
-                for chunk in chunks:
-                    wc = len(chunk.split())
-                    dur = max(
-                        getattr(settings, "text_over_min_duration", 1.0),
-                        min(
-                            getattr(settings, "text_over_max_duration", 6.0),
-                            getattr(settings, "text_over_word_seconds", 0.4) * wc,
-                        ),
-                    )
-                    text_over_items.append(
-                        {
-                            "text": chunk,
-                            "start_time": cur_t,
-                            "duration": dur,
-                            "word_count": wc,
-                        }
-                    )
-                    cur_t += dur
+                except Exception:
+                    text_over_items = []
 
             seg_out["text_over"] = text_over_items
             try:

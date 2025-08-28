@@ -124,14 +124,14 @@ class IVideoRenderer(Protocol):
     async def process_with_specification(
         self,
         specification: dict[str, Any],
+        seg_id: str,
         *,
-        target_path: str,
         canvas_width: int,
         canvas_height: int,
         frame_rate: int,
     ) -> str:
         """Process media based on abstract specification.
-        
+
         The specification is processor-agnostic and contains:
         - source information
         - transformation operations

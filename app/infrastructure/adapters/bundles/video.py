@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from app.application.pipeline.video.adapter_bundle import VideoPipelineAdapters
+from types import SimpleNamespace
+from app.application.interfaces.video_adapters import IVideoPipelineAdapters
 from app.infrastructure.adapters import (
     AssetRepoDownloader,
     FFMpegVideoRenderer,
@@ -11,11 +12,13 @@ from app.infrastructure.adapters import (
     GentleTranscriptionAligner,
     FFmpegMediaProbe,
     ImageProcessor,
+    LLMTranscriptSplitter,
+    TextOverBuilder,
 )
 from app.core.config import settings
 
 
-def get_video_adapter_bundle(*, temp_dir: str | None = None) -> VideoPipelineAdapters:
+def get_video_adapter_bundle(*, temp_dir: str | None = None) -> IVideoPipelineAdapters:
     """Provide the adapters container for the video pipeline.
 
     Kept under infrastructure/adapters/container to reflect it's a concrete
@@ -28,9 +31,9 @@ def get_video_adapter_bundle(*, temp_dir: str | None = None) -> VideoPipelineAda
         base_dir = os.getenv("TEMP_BASE_DIR", "data/tmp")
         os.makedirs(base_dir, exist_ok=True)
         work_dir = os.path.join(base_dir, settings.temp_batch_dir)
-    assets_dir = os.path.join(work_dir, "assets")
-    return VideoPipelineAdapters(
-        downloader=AssetRepoDownloader(base_dir=assets_dir),
+
+    return SimpleNamespace(
+        downloader=AssetRepoDownloader(temp_dir=work_dir),
         renderer=FFMpegVideoRenderer(temp_dir=work_dir),
         uploader=S3Uploader(),
         keyword_agent=PydanticAIKeywordAgent(),
@@ -38,4 +41,6 @@ def get_video_adapter_bundle(*, temp_dir: str | None = None) -> VideoPipelineAda
         aligner=GentleTranscriptionAligner(temp_dir=work_dir),
         media_probe=FFmpegMediaProbe(),
         image_processor=ImageProcessor(temp_dir=work_dir),
+        splitter=LLMTranscriptSplitter(temp_dir=work_dir),
+        text_over_builder=TextOverBuilder(temp_dir=work_dir),
     )

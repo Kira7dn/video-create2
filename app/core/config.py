@@ -126,10 +126,26 @@ class Settings(BaseSettings):
     ffmpeg_preset: str = "medium"
     ffmpeg_threads: int = 0  # 0 = auto
 
+    # Pipeline Step Defaults - CreateSegmentClipsStep
+    create_clips_retries: int = 1
+    create_clips_retry_backoff: float = 0.5
+    create_clips_max_backoff: float = 3.0
+    create_clips_jitter: float = 0.2
+    create_clips_use_exp_backoff: bool = True
+    create_clips_timeout: float | None = None
+
     # Download Settings
     download_timeout: int = 300  # 5 minutes for large video files
     download_max_concurrent: int = 10
     download_retry_attempts: int = 3
+
+    # Pipeline Step Defaults - DownloadAssetsStep
+    download_step_retries: int = 2
+    download_step_retry_backoff: float = 0.5
+    download_step_max_backoff: float = 3.0
+    download_step_jitter: float = 0.2
+    download_step_use_exp_backoff: bool = True
+    download_step_timeout: float | None = None
 
     # Temp Directory Settings
     temp_dir_prefix: str = "tmp_create_"
@@ -173,6 +189,14 @@ class Settings(BaseSettings):
     video_min_image_width: int = 1024  # Minimum image width for video segments
     video_min_image_height: int = 576  # Minimum image height for video segments
     pixabay_api_key: str = ""  # API key for Pixabay image search
+
+    # Pipeline Step Defaults - ImageAutoStep
+    image_auto_retries: int = 1
+    image_auto_retry_backoff: float = 0.5
+    image_auto_max_backoff: float = 3.0
+    image_auto_jitter: float = 0.2
+    image_auto_use_exp_backoff: bool = True
+    image_auto_timeout: float | None = None
 
     # Gentle Settings
     gentle_timeout: int = 120

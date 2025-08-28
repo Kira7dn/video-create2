@@ -39,8 +39,8 @@ def save_job_store(job_store):
 
 @router.post("", response_model=JobQueuedResponse)
 async def create_video(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
     use_case: CreateVideoUseCase = Depends(get_create_video_use_case),
 ):
     """Queue a job to create a video from uploaded JSON configuration."""
@@ -55,9 +55,7 @@ async def create_video(
     content = await file.read()
     filename = file.filename or ""
 
-    async def process_job(
-        file_bytes: bytes, filename: str, job_id: str, uc: CreateVideoUseCase
-    ):
+    async def process_job(file_bytes: bytes, filename: str, job_id: str):
         try:
             # Validate filename and extension
             if not filename:
@@ -78,7 +76,9 @@ async def create_video(
                 raise ValueError("Invalid JSON format: 'segments' key is required")
 
             # Run use case within a managed temp directory specific to this job
-            async with managed_temp_directory(prefix=settings.temp_batch_dir + "_") as temp_dir:
+            async with managed_temp_directory(
+                prefix=settings.temp_batch_dir + "_"
+            ) as temp_dir:
                 # Re-compose use case with job-scoped temp_dir so infra writes there
                 uc_scoped = get_create_video_use_case(temp_dir=temp_dir)
                 result = await uc_scoped.execute(json_data)
@@ -94,7 +94,7 @@ async def create_video(
             job_store[job_id]["error"] = str(e)
             save_job_store(job_store)
 
-    background_tasks.add_task(process_job, content, filename, job_id, use_case)
+    background_tasks.add_task(process_job, content, filename, job_id)
     return JobQueuedResponse(job_id=job_id)
 
 

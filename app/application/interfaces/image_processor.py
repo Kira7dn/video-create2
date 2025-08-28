@@ -10,7 +10,7 @@ class IImageProcessor(Protocol):
         *,
         target_width: int,
         target_height: int,
-        output_dir: str,
+        seg_id: str | None = None,
         smart_pad_color: bool = True,
         pad_color_method: str = "average_edge",
         auto_enhance: bool = True,

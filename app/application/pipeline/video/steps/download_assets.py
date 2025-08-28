@@ -14,11 +14,17 @@ class DownloadAssetsStep(BaseStep):
     required_keys = ["validated_data"]
     def __init__(self, downloader: IAssetDownloader):
         self.downloader = downloader
+        # Configure retry/timeout for network-bound operations
+        self.retries = int(getattr(settings, "download_step_retries", 2))
+        self.retry_backoff = float(getattr(settings, "download_step_retry_backoff", 0.5))
+        self.max_backoff = float(getattr(settings, "download_step_max_backoff", 3.0))
+        self.jitter = float(getattr(settings, "download_step_jitter", 0.2))
+        self.use_exponential_backoff = bool(
+            getattr(settings, "download_step_use_exp_backoff", True)
+        )
+        self.timeout = getattr(settings, "download_step_timeout", None)
 
     async def run(self, context: PipelineContext) -> None:  # type: ignore[override]
-        if self.downloader is None:  # defensive: ensure adapter is wired
-            raise RuntimeError("Asset downloader not configured")
-
         vd = context.get("validated_data")
         if vd is None:
             raise ValueError("validated_data not found")
@@ -50,25 +56,26 @@ class DownloadAssetsStep(BaseStep):
         max_concurrency = getattr(settings, "download_max_concurrent", 8)
         semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
 
-        async def _download_with_limit(url: str, kind: str):
+        async def _download_with_limit(url: str, kind: str, seg_id: str | None = None):
             async with semaphore:
-                return await self.downloader.download_asset(url, kind=kind)
+                return await self.downloader.download_asset(url, kind=kind, seg_id=seg_id)
 
         for i, segment in enumerate(segments):
             seg = dict(segment)
+            seg_id = seg.get("id") or f"seg_{i}"
             # Queue downloads for assets present in this segment
             for asset_type in asset_kinds:
                 asset = seg.get(asset_type)
                 if isinstance(asset, dict) and asset.get("url"):
                     url = asset["url"]
-                    coroutines.append(_download_with_limit(url, kind=asset_type))
+                    coroutines.append(_download_with_limit(url, kind=asset_type, seg_id=seg_id))
                     meta.append((i, asset_type))
             results.append(seg)
 
         # Queue background music download if available
         has_bg = isinstance(background_music, dict) and background_music.get("url")
         if has_bg:
-            coroutines.append(_download_with_limit(background_music["url"], kind="background_music"))
+            coroutines.append(_download_with_limit(background_music["url"], kind="background_music", seg_id="bg"))
             meta.append((-1, "background_music"))
         else:
             # Explicitly reflect absence of background music

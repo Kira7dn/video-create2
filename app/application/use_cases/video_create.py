@@ -1,6 +1,6 @@
 from typing import Dict
+from app.application.interfaces.video_adapters import IVideoPipelineAdapters
 from app.application.pipeline.base import PipelineContext
-from app.application.pipeline.video.adapter_bundle import VideoPipelineAdapters
 from app.application.pipeline.video.builder import build_video_pipeline_via_container
 
 
@@ -11,7 +11,7 @@ class CreateVideoUseCase:
     Infrastructure adapters into the Application pipeline.
     """
 
-    def __init__(self, adapters: VideoPipelineAdapters) -> None:
+    def __init__(self, adapters: IVideoPipelineAdapters) -> None:
         self._adapters = adapters
 
     async def execute(self, json_data: Dict) -> Dict:

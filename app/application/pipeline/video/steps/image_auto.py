@@ -28,14 +28,23 @@ class ImageAutoStep(BaseStep):
     def __init__(
         self,
         downloader: IAssetDownloader,
-        keyword_agent: Optional[IKeywordAgent] = None,
-        image_search: Optional[IImageSearch] = None,
-        image_processor: Optional[IImageProcessor] = None,
+        keyword_agent: IKeywordAgent,
+        image_search: IImageSearch,
+        image_processor: IImageProcessor,
     ) -> None:
-        self.keyword_agent: Optional[IKeywordAgent] = keyword_agent
+        self.keyword_agent = keyword_agent
         self.downloader = downloader
-        self.image_search: Optional[IImageSearch] = image_search
-        self.image_processor: Optional[IImageProcessor] = image_processor
+        self.image_search = image_search
+        self.image_processor = image_processor
+        # Configure retry/timeout for network + processing work
+        self.retries = int(getattr(settings, "image_auto_retries", 1))
+        self.retry_backoff = float(getattr(settings, "image_auto_retry_backoff", 0.5))
+        self.max_backoff = float(getattr(settings, "image_auto_max_backoff", 3.0))
+        self.jitter = float(getattr(settings, "image_auto_jitter", 0.2))
+        self.use_exponential_backoff = bool(
+            getattr(settings, "image_auto_use_exp_backoff", True)
+        )
+        self.timeout = getattr(settings, "image_auto_timeout", None)
 
     def _init_ai_agent(self) -> None:  # legacy no-op kept for compatibility
         return
@@ -48,7 +57,7 @@ class ImageAutoStep(BaseStep):
         Falls back to provided fields when AI is disabled/unavailable.
         """
         fields = fields or []
-        if not settings.ai_keyword_extraction_enabled or not self.keyword_agent:
+        if not settings.ai_keyword_extraction_enabled:
             return fields
 
         try:
@@ -72,9 +81,6 @@ class ImageAutoStep(BaseStep):
         min_width = min_width or settings.video_min_image_width
         min_height = min_height or settings.video_min_image_height
 
-        if not self.image_search:
-            raise ProcessingError("Image search adapter is required for ImageAutoStep")
-
         keywords_list = await self._ai_extract_keywords(content, fields)
 
         for keywords in keywords_list:
@@ -96,9 +102,6 @@ class ImageAutoStep(BaseStep):
             raise ProcessingError(
                 f"Không tìm được ảnh phù hợp cho content: '{content}' với fields: {fields}"
             )
-        if self.downloader is None:
-            raise ProcessingError("Asset downloader is required for ImageAutoStep")
-
         try:
             local_path = await self.downloader.download_asset(new_url, kind="image")
             return new_url, local_path
@@ -108,9 +111,6 @@ class ImageAutoStep(BaseStep):
     async def run(self, context: PipelineContext) -> None:  # type: ignore[override]
         """Validate/replace images directly on context.segments."""
         segments: List[dict] = context.get("segments") or []
-        if not self.downloader:
-            raise ProcessingError("Asset downloader is required for ImageAutoStep")
-
         keywords = context.get("keywords")  # Optional[List[str]]
         min_width = settings.video_min_image_width
         min_height = settings.video_min_image_height
@@ -145,7 +145,7 @@ class ImageAutoStep(BaseStep):
 
             # Preprocess image to target render size if there is an image and no video
             # Uses fixed resolution from settings; writes to a local tmp directory
-            if not video_obj and self.image_processor and merged.get("image"):
+            if not video_obj and merged.get("image"):
                 try:
                     width, height = settings.video_resolution_tuple
                     img_path = merged["image"].get("local_path")
@@ -154,6 +154,7 @@ class ImageAutoStep(BaseStep):
                             img_path,
                             target_width=width,
                             target_height=height,
+                            seg_id=str(merged.get("id")) if merged.get("id") is not None else None,
                             smart_pad_color=True,
                             pad_color_method="average_edge",
                             auto_enhance=True,
@@ -173,3 +174,11 @@ class ImageAutoStep(BaseStep):
 
         context.set("segments", new_segments)
         return
+
+    # Skip when feature is disabled via settings
+    def can_skip(self, context: PipelineContext) -> bool:
+        try:
+            enabled = bool(getattr(settings, "image_auto_enabled", True))
+        except Exception:
+            enabled = True
+        return not enabled

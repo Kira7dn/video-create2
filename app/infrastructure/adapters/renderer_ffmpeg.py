@@ -14,8 +14,6 @@ class FFMpegVideoRenderer(IVideoRenderer):
     """Renderer backed by existing VideoProcessor and ffmpeg utilities."""
 
     def __init__(self, *, temp_dir: str | None = None) -> None:
-        # Where intermediate files for concat/mixing are written.
-        # If None, we'll fall back to the directory of the output_path at call time.
         self._temp_dir = temp_dir
 
     async def duration(self, input_path: str) -> float:
@@ -47,7 +45,7 @@ class FFMpegVideoRenderer(IVideoRenderer):
         segments = []
         for idx, p in enumerate(inputs):
             segments.append({"id": f"seg_{idx}", "path": p})
-        temp_dir = self._temp_dir or (os.path.dirname(output_path) or ".")
+        temp_dir = self._temp_dir
         os.makedirs(temp_dir, exist_ok=True)
         # Transition param currently ignored; utils handles plain concat + optional BGM
         await asyncio.to_thread(
@@ -518,20 +516,16 @@ class FFMpegVideoRenderer(IVideoRenderer):
     async def process_with_specification(
         self,
         specification: dict[str, Any],
+        seg_id: str,
         *,
-        target_path: str,
         canvas_width: int,
         canvas_height: int,
         frame_rate: int,
     ) -> str:
         """Process media based on abstract specification."""
         # Handle temp_dir and file path construction internally
-        work_dir = self._temp_dir or "."
-        if not target_path.endswith((".mp4", ".mov", ".avi")):
-            full_target_path = str(Path(work_dir) / f"{target_path}.mp4")
-        else:
-            full_target_path = str(Path(work_dir) / target_path)
-
+        work_dir = self._temp_dir
+        full_target_path = str(Path(work_dir) / seg_id / "segment_video.mp4")
         # Translate abstract specification to renderer plan
         plan = self._translate_specification_to_plan(
             specification, canvas_width, canvas_height
@@ -553,7 +547,7 @@ class FFMpegVideoRenderer(IVideoRenderer):
         primary_source = specification.get("primary_source")
         audio_source = specification.get("audio_source")
         transformations = specification.get("transformations", [])
-        duration = specification.get("duration", 4.0)
+        spec_duration = specification.get("duration", 4.0)
 
         # Map source type
         input_type = "video" if source_type == "dynamic" else "image"
@@ -591,9 +585,9 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 target = "video" if transform.get("target") == "visual" else "audio"
                 direction = transform.get("direction", "in")
                 start = float(transform.get("start", 0))
-                duration = float(transform.get("duration", 0))
+                dur = float(transform.get("duration", 0))
 
-                fade_spec = {direction: {"start": start, "duration": duration}}
+                fade_spec = {direction: {"start": start, "duration": dur}}
                 ops.append({"op": "fade", "target": target, **fade_spec})
             elif transform_type == "text_overlay":
                 # Map abstract text overlay to concrete draw_text
@@ -616,7 +610,8 @@ class FFMpegVideoRenderer(IVideoRenderer):
                         },
                         "position": {
                             "x": layout.get("x", "(w-text_w)/2"),
-                            "y": layout.get("y", "(h-text_h)/2"),
+                            # Default to bottom placement with small margin
+                            "y": layout.get("y", "h-text_h-20"),
                         },
                         "box": {
                             "enabled": background.get("enabled", True),
@@ -631,5 +626,5 @@ class FFMpegVideoRenderer(IVideoRenderer):
             "audio_input": audio_source,
             "loop_image": input_type == "image",
             "ops": ops,
-            "duration": float(duration),
+            "duration": float(spec_duration),
         }

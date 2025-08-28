@@ -1,120 +1,118 @@
-# Hướng dẫn triển khai Pipeline theo Clean/Onion Architecture (cập nhật)
+# Guide to Implementing Pipelines with Clean/Onion Architecture (updated)
 
-Tài liệu này hướng dẫn triển khai cấu trúc: Steps → Pipeline → UseCase + Adapters (DI) → Endpoint.
-Thiết kế tuân thủ OOP, SOLID, Clean/Onion: Endpoint ở Delivery, UseCase và Steps ở Application, Adapters ở Infrastructure.
+This document explains how to structure: Steps → Pipeline → UseCase + Adapters (DI) → Endpoint.
+Design follows OOP, SOLID, Clean/Onion: Endpoint in Delivery, UseCase and Steps in Application, Adapters in Infrastructure.
 
-## Kiến trúc tổng quan (Clean/Onion Architecture)
+## Table of contents
 
-- **Delivery Layer** (`app/api/v1/endpoints/*`): nhận request HTTP, gọi UseCase qua DI.
+- Introduction & Overview
+- Project structure (common)
+- Core primitives (PipelineContext, Step, BaseStep, Pipeline, PipelineFactory)
+- PipelineContext usage conventions (Data Flow)
+- Step-by-step guide: end-to-end (Step → Builder → Container → UseCase → DI → Router → Usage)
+- Best practices
+- Clean/Onion/SOLID compliance checklist
+- Additional implementation notes
+
+## Overview (Clean/Onion Architecture)
+
+- **Delivery Layer** (`app/presentation/api/v1/routers/*`, `app/presentation/api/v1/dependencies/*`): receives HTTP requests, composes UseCases via DI.
 - **Application Layer** (`app/application/`):
-  - UseCase: điều phối business logic, khởi tạo Pipeline.
-  - Pipeline + Steps: thực thi tuần tự các bước xử lý.
-  - Interfaces (Ports): định nghĩa contracts cho Infrastructure.
-- **Infrastructure Layer** (`app/infrastructure/adapters/*`): triển khai Ports, tương tác với external services.
+  - UseCase: orchestrates business logic, initializes Pipelines.
+  - Pipeline + Steps: executes a sequence of processing steps.
+  - Interfaces (Ports): defines contracts for Infrastructure.
+- **Infrastructure Layer** (`app/infrastructure/adapters/*`): implements Ports, interacts with external services.
 
-## Cấu trúc thư mục (thu gọn)
+## Project structure (condensed)
 
-````text
+```text
 app/
-  api/
-    v1/
-      endpoints/
-        pipelines.py                 # Endpoint gọi UseCase (ví dụ trong tài liệu)
+  presentation/
+    api/
+      v1/
+        routers/
+          my_pipeline.py             # Example pipeline endpoint (optional)
+        dependencies/
+          my_pipeline.py             # DI: get_run_example_use_case
 
   application/
     pipeline/
-      base.py                        # PipelineContext, BaseStep, Pipeline
-      factory.py                     # PipelineFactory (tùy chọn middleware)
-      video/                         # Video pipeline package
-        __init__.py                  # (tùy chọn) export public API
-        adapter_bundle.py            # VideoPipelineAdapters (bundle)
-        builder.py                   # Builders
-        steps/                       # Mỗi step tách file riêng
+      base.py                        # PipelineContext, BaseStep, Pipeline, Middleware
+      factory.py                     # PipelineFactory (middlewares, fail_fast, legacy adapter)
+      my_pipeline/                   # Example pipeline package (from docs)
+        builder.py                   # Builder
+        steps/                       # Example steps
 
     interfaces/                      # Ports (Application layer contracts)
 
     use_cases/
-      run_video_pipeline.py          # RunVideoPipelineUseCase
+      run_example_pipeline.py        # RunExamplePipelineUseCase
 
   core/
-    dependencies.py                  # DI: khởi tạo adapters và pipeline, trả về UseCase
+    config.py                        # Settings
 
   infrastructure/
-    adapters/                        # Adapters (Infrastructure layer)
+    adapters/                        # Concrete adapter implementations (Infrastructure layer)
 
-config/
-  settings.py                        # Cấu hình (ví dụ các loại asset, đường dẫn)
+utils/                               # Utilities (resource manager, etc.)
+```
 
-utils/                               # Tiện ích (nếu dùng trong steps/adapters)
+## Core primitives
 
-## Hợp đồng cốt lõi
-
-Các primitive được định nghĩa tại `app/application/pipeline/base.py`:
+Primitives in `app/application/pipeline/base.py` (simplified and consistent with current code):
 
 - `PipelineContext`:
-  - `input: Mapping[str, Any]` (read-only usage): payload gốc của run.
-  - `artifacts: Dict[str, Any]`: dữ liệu làm việc và outputs giữa các bước.
-  - Reserved keys trong artifacts: `_run_id`, `_temp_dir` với helpers:
-    - `ensure_run_id()`, `get_run_id()`
-    - `ensure_temp_dir()`, `get_temp_dir()`
-- `Step` (Protocol): interface cho mỗi step, triển khai `async def run(context: PipelineContext) -> None`.
-- `BaseStep`: abstract base class với lifecycle hooks (`on_start/on_finish`), timing và error handling.
-- `Pipeline`: orchestrator nhận danh sách steps và thực thi tuần tự qua `execute(context)`.
+  - `input: Mapping[str, Any]`: immutable-like run payload (do not mutate).
+  - `artifacts: Dict[str, Any]`: cross-step data.
+  - Reserved key: `_run_id` with helpers `ensure_run_id()`, `get_run_id()`, `set_run_id()`.
+  - Does not manage `temp_dir` inside Context (handled at Presentation/Infrastructure when needed).
+- `Step` (Protocol): defines `async def __call__(context) -> None`. `BaseStep` provides lifecycle and requires `async def run(context)`.
+- `BaseStep`: sync hooks (`on_start/on_finish/on_skip`), input validation (`required_keys`), retry/backoff/timeout and status.
+- `Pipeline`: orchestrator to run steps sequentially, gather results, supports `fail_fast`.
 
 ### PipelineContext
+
 ```python
-from typing import Any, Dict, Mapping, Optional
-from pathlib import Path
-import uuid
-import tempfile
+from dataclasses import dataclass, field
+from typing import Any, Dict, Mapping, Optional, ClassVar
 
+@dataclass(slots=True)
 class PipelineContext:
-    """Context object chứa input và artifacts cho pipeline execution."""
+    """Common pipeline context shared across all pipelines."""
 
-    def __init__(self, input: Mapping[str, Any]):
-        self._input = input or {}
-        self.artifacts: Dict[str, Any] = {}
+    RUN_ID_KEY: ClassVar[str] = "_run_id"
 
-    @property
-    def input(self) -> Mapping[str, Any]:
-        """Read-only access to input payload."""
-        return self._input
+    input: Mapping[str, Any]
+    artifacts: Dict[str, Any] = field(default_factory=dict)
 
-    def get_input(self) -> Mapping[str, Any]:
-        """Get input payload (alternative method)."""
-        return self._input
+    # Artifacts helpers
+    def set(self, key: str, value: Any) -> None: self.artifacts[key] = value
+    def get(self, key: str, default: Any = None) -> Any: return self.artifacts.get(key, default)
+    def has(self, key: str) -> bool: return key in self.artifacts
+    def remove(self, key: str) -> None: self.artifacts.pop(key, None)
+    def update(self, **items: Any) -> None: self.artifacts.update(items)
 
-    def get(self, key: str, default: Any = None) -> Any:
-        """Get artifact by key."""
-        return self.artifacts.get(key, default)
+    # Validation helpers
+    def require(self, keys: list[str]) -> None:
+        missing = [k for k in keys if k not in self.artifacts]
+        if missing:
+            raise KeyError(f"Missing required context keys: {', '.join(missing)}")
 
-    def set(self, key: str, value: Any) -> None:
-        """Set artifact value."""
-        self.artifacts[key] = value
-
-    # Reserved keys helpers
-    def ensure_run_id(self) -> str:
-        """Ensure run_id exists, create if not."""
-        if "_run_id" not in self.artifacts:
-            self.artifacts["_run_id"] = str(uuid.uuid4())
-        return self.artifacts["_run_id"]
-
+    # Run ID helpers
     def get_run_id(self) -> Optional[str]:
-        """Get run_id if exists."""
-        return self.artifacts.get("_run_id")
-
-    def ensure_temp_dir(self) -> Path:
-        """Ensure temp directory exists, create if not."""
-        if "_temp_dir" not in self.artifacts:
-            temp_dir = Path(tempfile.mkdtemp(prefix="pipeline_"))
-            self.artifacts["_temp_dir"] = str(temp_dir)
-        return Path(self.artifacts["_temp_dir"])
-
-    def get_temp_dir(self) -> Optional[Path]:
-        """Get temp directory if exists."""
-        temp_path = self.artifacts.get("_temp_dir")
-        return Path(temp_path) if temp_path else None
-````
+        return self.get(self.RUN_ID_KEY)
+    def set_run_id(self, run_id: str) -> None:
+        self.set(self.RUN_ID_KEY, run_id)
+    def ensure_run_id(self, factory: Optional[callable[[], str]] = None) -> str:
+        rid = self.get_run_id()
+        if not rid and factory:
+            rid = factory()
+        if not rid:
+            import uuid as _uuid
+            rid = str(_uuid.uuid4())
+        self.set_run_id(rid)
+        return rid
+```
 
 ### Step Protocol
 
@@ -122,503 +120,415 @@ class PipelineContext:
 from typing import Protocol
 
 class Step(Protocol):
-    """Interface cho mỗi pipeline step."""
-
-    async def run(self, context: PipelineContext) -> None:
-        """Execute step logic.
-
-        Args:
-            context: Pipeline context chứa input và artifacts
-        """
-        ...
+    async def __call__(self, context: PipelineContext) -> None: ...
 ```
+
+Lưu ý: `BaseStep` yêu cầu implement `async def run(context)` và cung cấp `__call__` lifecycle. `PipelineFactory` tự động bọc các legacy step chỉ có `run()` thành callable step.
 
 ### BaseStep
 
 ```python
-import time
-import logging
+import logging, asyncio, random
 from abc import ABC, abstractmethod
+from time import perf_counter
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-class BaseStep(ABC):
-    """Abstract base class với lifecycle hooks và error handling."""
+class StepStatus(str, Enum):
+    PENDING = "pending"; RUNNING = "running"; COMPLETED = "completed"; SKIPPED = "skipped"; FAILED = "failed"
 
-    name: str = "unnamed_step"
+class BaseStep(ABC):
+    name: str = "base_step"
+    required_keys: list[str] = []
+    retries: int = 0
+    retry_backoff: float = 0.5
+    timeout: float | None = None
+    use_exponential_backoff: bool = True
+    max_backoff: float = 5.0
+    jitter: float = 0.1
+    retry_exceptions: dict[type[Exception], dict[str, object]] = {}
+
+    status: StepStatus = StepStatus.PENDING
+    last_error: Exception | None = None
+    duration: float = 0.0
+    attempts: int = 0
 
     async def __call__(self, context: PipelineContext) -> None:
-        """Execute step với lifecycle management."""
-        start_time = time.time()
-
-        try:
-            logger.info(f"Starting step: {self.name}")
-            await self.on_start(context)
-            await self.run(context)
-            await self.on_finish(context)
-
-            duration = time.time() - start_time
-            logger.info(f"Completed step: {self.name} in {duration:.2f}s")
-
-        except Exception as e:
-            duration = time.time() - start_time
-            logger.error(f"Failed step: {self.name} after {duration:.2f}s - {e}")
-            await self.on_error(context, e)
-            raise
+        attempts = 0
+        self.last_error = None
+        if not self.validate_inputs(context):
+            missing = [k for k in self.required_keys if not context.has(k)]
+            raise KeyError(f"Missing required inputs for step '{self.name}': {', '.join(missing)}")
+        if self.can_skip(context):
+            self.status = StepStatus.SKIPPED
+            self.on_skip(context)
+            return
+        while True:
+            attempts += 1; self.attempts = attempts; self.status = StepStatus.RUNNING
+            self.on_start(context); start = perf_counter()
+            try:
+                if self.timeout:
+                    await asyncio.wait_for(self.run(context), timeout=self.timeout)
+                else:
+                    await self.run(context)
+                self.status = StepStatus.COMPLETED; return
+            except Exception as e:
+                self.last_error = e; self.status = StepStatus.FAILED
+                # apply retry policy (global or per-exception)
+                eff = dict(retries=self.retries, retry_backoff=self.retry_backoff, max_backoff=self.max_backoff,
+                           jitter=self.jitter, use_exponential_backoff=self.use_exponential_backoff)
+                for exc_t, cfg in self.retry_exceptions.items():
+                    if isinstance(e, exc_t): eff.update(cfg); break
+                if attempts <= int(eff["retries"]):
+                    base = max(0.0, float(eff["retry_backoff"]))
+                    sleep_s = base * (2 ** max(0, attempts - 1)) if eff["use_exponential_backoff"] else base
+                    sleep_s = min(float(eff["max_backoff"]), float(sleep_s))
+                    sleep_s += random.uniform(0.0, max(0.0, float(eff["jitter"])) )
+                    await asyncio.sleep(sleep_s); continue
+                raise
+            finally:
+                self.duration = perf_counter() - start
+                self.on_finish(context, self.duration)
 
     @abstractmethod
-    async def run(self, context: PipelineContext) -> None:
-        """Main step logic - must be implemented by subclasses."""
-        pass
+    async def run(self, context: PipelineContext) -> None: ...
 
-    async def on_start(self, context: PipelineContext) -> None:
-        """Hook called before step execution."""
-        pass
-
-    async def on_finish(self, context: PipelineContext) -> None:
-        """Hook called after successful step execution."""
-        pass
-
-    async def on_error(self, context: PipelineContext, error: Exception) -> None:
-        """Hook called when step fails."""
-        pass
+    # Hooks & utils
+    def on_start(self, context: PipelineContext) -> None: logger.debug("Step %s start", self.name)
+    def on_finish(self, context: PipelineContext, duration: float) -> None:
+        logger.info("Step %s finished in %.3fs status=%s attempts=%d run_id=%s", self.name, duration, self.status.value, self.attempts, context.get_run_id())
+    def on_skip(self, context: PipelineContext) -> None: logger.info("Step %s skipped", self.name)
+    def validate_inputs(self, context: PipelineContext) -> bool: return all(context.has(k) for k in self.required_keys) if self.required_keys else True
+    def can_skip(self, context: PipelineContext) -> bool: return False
 ```
 
 ### Pipeline
 
 ```python
-from typing import List
+from typing import List, TypedDict, Optional, Dict, Any
+
+class StepResult(TypedDict):
+    name: str; status: str; duration: float; error: Optional[str]; attempts: int
+
+class PipelineResult(TypedDict):
+    success: bool; duration: float; steps: List[StepResult]; error: Optional[str]; context: PipelineContext
 
 class Pipeline:
-    """Orchestrator thực thi tuần tự các steps."""
+    def __init__(self, steps: List[Step], *, fail_fast: bool = True):
+        self._steps = steps; self.fail_fast = fail_fast
 
-    def __init__(self, steps: List[Step]):
-        self.steps = steps
-
-    async def execute(self, context: PipelineContext) -> Dict[str, Any]:
-        """Execute all steps sequentially.
-
-        Args:
-            context: Pipeline context
-
-        Returns:
-            Dict containing final context and metadata
-        """
-        logger.info(f"Starting pipeline with {len(self.steps)} steps")
-
-        try:
-            for i, step in enumerate(self.steps):
-                logger.info(f"Executing step {i+1}/{len(self.steps)}: {getattr(step, 'name', 'unnamed')}")
-
-                if hasattr(step, '__call__'):
-                    await step(context)  # BaseStep với lifecycle
-                else:
-                    await step.run(context)  # Raw Step protocol
-
-            logger.info("Pipeline completed successfully")
-            return {
-                "status": "success",
-                "context": context.artifacts,
-                "steps_executed": len(self.steps)
-            }
-
-        except Exception as e:
-            logger.error(f"Pipeline failed: {e}")
-            return {
-                "status": "failed",
-                "error": str(e),
-                "context": context.artifacts,
-                "steps_executed": i if 'i' in locals() else 0
-            }
+    async def execute(self, context: PipelineContext) -> PipelineResult:
+        context.ensure_run_id()
+        from time import perf_counter
+        start = perf_counter(); results: Dict[str, Any] = {"success": False, "duration": 0.0, "steps": [], "error": None}
+        for step in self._steps:
+            info = {"name": getattr(step, "name", step.__class__.__name__), "status": "pending", "duration": 0.0, "error": None, "attempts": 0}
+            results["steps"].append(info)
+            s = perf_counter()
+            try:
+                await step(context)
+                info["status"] = getattr(step, "status").value
+                info["attempts"] = int(getattr(step, "attempts", 1) or 1)
+            except Exception as e:
+                info["status"] = "failed"; info["error"] = str(e)
+                info["attempts"] = int(getattr(step, "attempts", 1) or 1)
+                if self.fail_fast: raise
+            finally:
+                info["duration"] = perf_counter() - s
+        results["duration"] = perf_counter() - start
+        results["success"] = all(s["status"] == "completed" for s in results["steps"])
+        results["context"] = context
+        return results  # PipelineResult
 ```
 
 ### PipelineFactory
 
 ```python
 from typing import List
+from app.application.pipeline.base import Middleware
+import asyncio
 
 class PipelineFactory:
-    """Factory để build Pipeline với middleware support."""
+    def __init__(self, *, middlewares: List[Middleware] | None = None, fail_fast: bool = True):
+        self._steps: List[Step] = []; self._middlewares = list(middlewares or []); self._fail_fast = fail_fast
 
-    def __init__(self):
-        self._steps: List[Step] = []
+    def add(self, step: Step) -> "PipelineFactory":
+        wrapped = step
+        # Tự động bọc legacy step chỉ có async run(context)
+        if not hasattr(wrapped, "__call__") and hasattr(wrapped, "run") and asyncio.iscoroutinefunction(getattr(wrapped, "run")):
+            impl = wrapped
+            class _RunAdapter:
+                def __init__(self, impl_obj): self.impl = impl_obj; self.name = getattr(impl_obj, "name", impl_obj.__class__.__name__)
+                async def __call__(self, context): await self.impl.run(context)
+            wrapped = _RunAdapter(impl)
+        for mw in self._middlewares: wrapped = mw(wrapped)
+        self._steps.append(wrapped); return self
 
-    def add(self, step: Step) -> 'PipelineFactory':
-        """Add step to pipeline."""
-        self._steps.append(step)
-        return self
+    def extend(self, steps: List[Step]) -> "PipelineFactory":
+        for s in steps: self.add(s); return self
 
-    def build(self) -> Pipeline:
-        """Build final Pipeline instance."""
-        if not self._steps:
-            raise ValueError("Pipeline must have at least one step")
-        return Pipeline(self._steps)
+    def build(self) -> Pipeline: return Pipeline(self._steps, fail_fast=self._fail_fast)
 ```
 
-## Quy ước sử dụng PipelineContext (Data Flow)
-
-- **Input (immutable)**: đọc từ `context.input` hoặc `context.get_input()`. KHÔNG ghi vào input.
-- **Artifacts (mutable state)**: ghi/đọc outputs qua `context.artifacts` với keys rõ ràng:
-  - Naming: `snake_case`, có thể namespace (vd: `video.segment_clips`, `audio.synthesized_path`).
-  - Flow: `validated_data` → `processed_items` → `final_output`.
-- **Reserved keys**: `_run_id`, `_temp_dir` cho metadata kỹ thuật, không trộn với business data.
-
-## Tạo một Step mới (ví dụ)
+#### Logging middleware example (Observability)
 
 ```python
-from app.application.pipeline.base import BaseStep, PipelineContext
-
-class ValidateInputStep(BaseStep):
-    name = "validate_input"
-
-    async def run(self, context: PipelineContext) -> None:
-        # 1. Setup run metadata
-        context.ensure_run_id()
-        context.ensure_temp_dir()
-
-        # 2. Validate business input
-        data = context.get_input()
-        if not isinstance(data, dict) or "json_data" not in data:
-            raise ValueError("input.json_data is required")
-
-        jd = data.get("json_data", {})
-        if not isinstance(jd, dict) or not isinstance(jd.get("segments"), list):
-            raise ValueError("'segments' list is required")
-
-        # 3. Set validated output
-        context.set("validated_data", jd)
-```
-
-## Lắp ráp Pipeline và DI (Steps → Pipeline)
-
-```python
-# Sử dụng Adapter Bundle pattern (khuyến nghị)
-from app.application.pipeline.video.builder import build_video_pipeline_via_container
-from app.application.pipeline.video.adapter_bundle import VideoPipelineAdapters
-
-# Tạo adapter bundle
-adapters = VideoPipelineAdapters(
-    assets=assets,
-    renderer=renderer,
-    uploader=uploader,
-)
-
-# Build pipeline với bundle
-pipeline = build_video_pipeline_via_container(adapters)
-```
-
-## Dependency Provider (Adapters → UseCase)
-
-```python
-# app/core/dependencies.py (ví dụ tham khảo)
-from app.application.pipeline.video.builder import build_video_pipeline_via_container
-from app.application.pipeline.video.adapter_bundle import VideoPipelineAdapters
-from app.application.use_cases.run_video_pipeline import RunVideoPipelineUseCase
-
-# Ví dụ các factory adapters tầng hạ tầng
-from app.infrastructure.adapters.asset_repo import AssetRepoFactory  # ví dụ
-from app.infrastructure.adapters.video_renderer import VideoRendererFactory  # ví dụ
-from app.infrastructure.adapters.uploader import UploaderFactory  # ví dụ
-
-
-def get_video_use_case() -> RunVideoPipelineUseCase:
-    assets = AssetRepoFactory.create()
-    renderer = VideoRendererFactory.create()
-    uploader = UploaderFactory.create()
-
-    # Sử dụng Adapter Bundle pattern
-    adapters = VideoPipelineAdapters(
-        assets=assets,
-        renderer=renderer,
-        uploader=uploader,
-    )
-    pipeline = build_video_pipeline_via_container(adapters)
-    return RunVideoPipelineUseCase(pipeline=pipeline)
-```
-
-## UseCase và Endpoint (Endpoint → UseCase)
-
-```python
-# app/application/use_cases/run_video_pipeline.py
+# File: app/application/pipeline/middlewares/logging.py
+from typing import Callable, Awaitable
 from app.application.pipeline.base import PipelineContext
+import logging
 
-class RunVideoPipelineUseCase:
-    def __init__(self, pipeline):
-        self._pipeline = pipeline
+StepCallable = Callable[[PipelineContext], Awaitable[None]]
 
-    async def execute(self, context: PipelineContext | None = None) -> dict:
-        ctx = context or PipelineContext(input={})
-        result = await self._pipeline.execute(ctx)
-        return result["context"]
 
-# app/api/v1/endpoints/pipelines.py
-from fastapi import APIRouter, Depends
-from app.application.pipeline.base import PipelineContext
-from app.application.use_cases.run_video_pipeline import RunVideoPipelineUseCase
-from app.core.dependencies import get_video_use_case
+def make_logging_middleware(logger: logging.Logger) -> Callable[[StepCallable], StepCallable]:
+    """Wrap each step to log start/finish with run_id and duration if available."""
+    def middleware(step: StepCallable) -> StepCallable:
+        async def wrapped(context: PipelineContext) -> None:
+            name = getattr(step, "name", getattr(step, "__name__", step.__class__.__name__))
+            run_id = context.get_run_id() or "-"
+            logger.info("[run=%s] step %s start", run_id, name)
+            try:
+                await step(context)
+            finally:
+                # If step has duration (BaseStep), include it
+                duration = getattr(step, "duration", None)
+                if duration is not None:
+                    logger.info("[run=%s] step %s finish in %.3fs", run_id, name, duration)
+                else:
+                    logger.info("[run=%s] step %s finish", run_id, name)
+        return wrapped  # type: ignore[return-value]
 
-router = APIRouter(prefix="/pipelines", tags=["pipelines"])
+    return middleware
 
-@router.post("/run-video")
-async def run_video_pipeline(
-    payload: dict,
-    use_case: RunVideoPipelineUseCase = Depends(get_video_use_case),
-):
-    ctx = PipelineContext(input=payload)
-    context = await use_case.execute(ctx)
-    return {"run_id": context.get("_run_id"), "final_video": context.get("final_video_url")}
-```
 
-Tại endpoint, sử dụng DI để cung cấp adapters và build pipeline rồi gọi UseCase.
-
-## Best practices
-
-- **SRP cho Step**: mỗi Step làm một việc rõ ràng, đặt tên artifact đầu ra rõ ràng.
-- **Typing nhẹ**: cân nhắc TypedDict/Pydantic cho artifacts quan trọng (vd: `ValidatedData`, `SegmentClip`).
-- **Idempotency và retry**: đối với IO, dùng đường dẫn xác định dưới `ensure_temp_dir()` và skip nếu tồn tại.
-- **Observability**: log theo `run_id`, đo thời gian bằng `BaseStep`.
-- **Không chia sẻ artifacts giữa pipelines khác nhau** trừ khi có namespace rõ ràng.
-
----
-
-Ghi chú triển khai bổ sung:
-
-- Sử dụng `PipelineContext.ensure_run_id()` và `ensure_temp_dir()` ngay ở bước đầu để ổn định I/O.
-- Artifacts chính:
-  - `validated_data` → `processed_segments` → `segment_clips` → `final_video_path` → `final_video_url`.
-- Builder sử dụng Adapter Container pattern để quản lý dependencies một cách scalable và type-safe.
-
----
-
-## Template tạo pipeline mới (chuẩn duy nhất)
-
-Mô hình: Steps → Pipeline → Builder (public) → UseCase → Endpoint
-
-1. Tạo Steps
-
-```python
-# app/application/pipeline/my_pipeline/steps.py
-from app.application.pipeline.base import BaseStep, PipelineContext
-
-class ValidateInputStep(BaseStep):
-    name = "validate_input"
-    async def run(self, context: PipelineContext) -> None:
-        data = context.get_input()
-        # ... validate
-        context.set("validated_data", data)
-        context.ensure_run_id()
-        context.ensure_temp_dir()
-
-class ProcessDataStep(BaseStep):
-    def __init__(self, processor: IProcessor) -> None:
-        super().__init__()
-        self._processor = processor
-
-    name = "process_data"
-
-    async def run(self, context: PipelineContext) -> None:
-        # 1. Get input from previous step
-        validated_data = context.get("validated_data")
-        if not validated_data:
-            raise ValueError("validated_data is required from previous step")
-
-        # 2. Process via injected adapter
-        result = await self._processor.process(validated_data)
-
-        # 3. Set output for next step
-        context.set("processed_result", result)
-
-class SaveResultStep(BaseStep):
-    def __init__(self, storage: IStorage) -> None:
-        super().__init__()
-        self._storage = storage
-
-    name = "save_result"
-
-    async def run(self, context: PipelineContext) -> None:
-        result = context.get("processed_result")
-        run_id = context.get_run_id()
-
-        save_path = f"results/{run_id}/output.json"
-        saved_url = await self._storage.save(result, save_path)
-        context.set("saved_url", saved_url)
-
-class NotifyStep(BaseStep):
-    def __init__(self, notifier: INotifier) -> None:
-        super().__init__()
-        self._notifier = notifier
-
-    name = "notify_completion"
-
-    async def run(self, context: PipelineContext) -> None:
-        run_id = context.get_run_id()
-        saved_url = context.get("saved_url")
-
-        message = f"Pipeline {run_id} completed. Result: {saved_url}"
-        await self._notifier.notify(message)
-```
-
-2. Định nghĩa Interfaces (Ports) nếu cần adapters
-
-```python
-# app/application/interfaces/processor.py
-from typing import Protocol
-
-class IProcessor(Protocol):
-    async def process(self, payload: dict) -> str: ...
-
-class IStorage(Protocol):
-    async def save(self, data: dict, path: str) -> str: ...
-
-class INotifier(Protocol):
-    async def notify(self, message: str) -> None: ...
-```
-
-3. Tạo Adapter Container (Application Layer)
-
-```python
-# app/application/pipeline/my_pipeline/adapters.py
-from dataclasses import dataclass
-from typing import Optional
-from app.application.interfaces.processor import IProcessor, IStorage, INotifier
-
-@dataclass
-class MyPipelineAdapters:
-    """Container cho tất cả adapters của MyPipeline.
-
-    Chứa Application interfaces (Ports), được populate bởi Infrastructure.
-    """
-    processor: IProcessor
-    storage: IStorage
-    notifier: Optional[INotifier] = None  # Optional adapter
-```
-
-4. Tạo Builder (public API, STRICT)
-
-```python
-# app/application/pipeline/my_pipeline/orchestrator.py
-from app.application.pipeline.base import Pipeline
+# Example usage in builder
+import logging
 from app.application.pipeline.factory import PipelineFactory
-from app.application.pipeline.my_pipeline.steps import ValidateInputStep, ProcessDataStep, SaveResultStep, NotifyStep
-from app.application.pipeline.my_pipeline.adapters import MyPipelineAdapters
+from app.application.pipeline.middlewares.logging import make_logging_middleware
 
-def build_my_pipeline_via_builder(adapters: MyPipelineAdapters) -> Pipeline:
-    """Build pipeline với Adapter Container pattern.
 
-    Args:
-        adapters: Container chứa tất cả required/optional adapters
-
-    Returns:
-        Configured Pipeline ready to execute
-    """
-    factory = PipelineFactory()
-    factory.add(ValidateInputStep())
-    factory.add(ProcessDataStep(adapters.processor))
-    factory.add(SaveResultStep(adapters.storage))
-
-    # Optional steps dựa trên adapters có sẵn
-    if adapters.notifier is not None:
-        factory.add(NotifyStep(adapters.notifier))
-
+def build_example_pipeline_via_container_with_logging(adapters: ExamplePipelineAdapters) -> Pipeline:
+    logger = logging.getLogger("pipeline")
+    factory = PipelineFactory(middlewares=[make_logging_middleware(logger)], fail_fast=True)
+    factory.add(ExampleStep(adapters.example_processor))
     return factory.build()
 ```
 
-5. UseCase
+## PipelineContext usage conventions (Data Flow)
+
+- **Input (immutable-like)**: read from `context.input`. DO NOT write to input.
+- **Artifacts (mutable)**: write/read outputs via helpers `set/get/has/update`.
+  - Naming: `snake_case`, with optional namespacing (e.g., `domain.segment_items`, `audio.synthesized_path`).
+  - Suggested flow: `validated_data` → `processed_items` → `output_chunks` → `final_output_path` → `final_output_url`.
+- **Reserved keys**: only `_run_id` in Context. Manage `temp_dir` at Presentation/Infrastructure when needed.
+
+## Step-by-step guide: end-to-end (Step → Builder → Container → UseCase → DI → Router → Usage)
 
 ```python
-# app/application/use_cases/run_my_pipeline.py
+# File: app/application/pipeline/my_pipeline/steps/example_step.py
+from app.application.pipeline.base import BaseStep, PipelineContext
+from app.application.interfaces.example import IExampleProcessor
+
+
+class ExampleStep(BaseStep):
+    name = "example_step"
+
+    def __init__(self, processor: IExampleProcessor) -> None:
+        super().__init__()
+        self._processor = processor
+
+    async def run(self, context: PipelineContext) -> None:
+        context.ensure_run_id()
+        data = context.input
+        if not isinstance(data, dict):
+            raise ValueError("context.input must be a dict")
+        result = await self._processor.process(data)
+        context.set("example_result", result)
+```
+
+```python
+# File: app/application/interfaces/example.py
+from typing import Protocol
+
+
+class IExampleProcessor(Protocol):
+    async def process(self, data: dict) -> dict: ...
+```
+
+```python
+# File: app/infrastructure/adapters/example_processor.py
+from app.application.interfaces.example import IExampleProcessor
+
+
+class ExampleProcessor(IExampleProcessor):
+    async def process(self, data: dict) -> dict:
+        return {"echo_size": len(data), "ok": True}
+```
+
+```python
+# File: app/application/pipeline/my_pipeline/builder.py
+from dataclasses import dataclass
+from app.application.pipeline.factory import PipelineFactory
+from app.application.pipeline.base import Pipeline
+from app.application.pipeline.my_pipeline.steps.example_step import ExampleStep
+from app.application.interfaces.example import IExampleProcessor
+
+
+@dataclass
+class ExamplePipelineAdapters:
+    example_processor: IExampleProcessor
+
+
+def build_example_pipeline_via_container(adapters: ExamplePipelineAdapters) -> Pipeline:
+    factory = PipelineFactory()
+    factory.add(ExampleStep(adapters.example_processor))
+    return factory.build()
+```
+
+```python
+# File: app/application/use_cases/run_example_pipeline.py
 from app.application.pipeline.base import PipelineContext, Pipeline
 
-class RunMyPipelineUseCase:
+
+class RunExamplePipelineUseCase:
     def __init__(self, pipeline: Pipeline) -> None:
         self._pipeline = pipeline
 
-    async def execute(self, ctx: PipelineContext) -> dict:
+    async def execute(self, input_data: dict) -> dict:
+        ctx = PipelineContext(input=input_data)
         result = await self._pipeline.execute(ctx)
         return result["context"]
 ```
 
-6. DI Provider (Infrastructure Layer)
-
 ```python
-# app/core/dependencies.py
-from app.application.pipeline.my_pipeline.orchestrator import build_my_pipeline_via_builder
-from app.application.pipeline.my_pipeline.adapters import MyPipelineAdapters
-from app.application.use_cases.run_my_pipeline import RunMyPipelineUseCase
+# File: app/presentation/api/v1/dependencies/my_pipeline.py
+from app.infrastructure.adapters.example_processor import ExampleProcessor
+from app.application.pipeline.my_pipeline.builder import (
+    build_example_pipeline_via_container,
+    ExamplePipelineAdapters,
+)
+from app.application.use_cases.run_example_pipeline import RunExamplePipelineUseCase
 
-# Infrastructure factories
-from app.infrastructure.adapters.processor import ProcessorFactory
-from app.infrastructure.adapters.storage import StorageFactory
-from app.infrastructure.adapters.notifier import NotifierFactory
 
-def get_my_pipeline_use_case() -> RunMyPipelineUseCase:
-    """DI Provider: Infrastructure tạo adapters và inject vào Application."""
-    # Infrastructure Layer: Tạo concrete implementations
-    processor = ProcessorFactory.create()
-    storage = StorageFactory.create()
-    notifier = NotifierFactory.create()  # Optional
-
-    # Application Layer: Populate adapter container
-    adapters = MyPipelineAdapters(
-        processor=processor,
-        storage=storage,
-        notifier=notifier,
-    )
-
-    # Application Layer: Build pipeline với container
-    pipeline = build_my_pipeline_via_builder(adapters)
-    return RunMyPipelineUseCase(pipeline=pipeline)
+def get_run_example_use_case() -> RunExamplePipelineUseCase:
+    adapters = ExamplePipelineAdapters(example_processor=ExampleProcessor())
+    pipeline = build_example_pipeline_via_container(adapters)
+    return RunExamplePipelineUseCase(pipeline)
 ```
 
-7. Endpoint (tùy chọn)
-
 ```python
-# app/api/v1/endpoints/my_pipeline.py
+# File: app/presentation/api/v1/routers/my_pipeline.py
 from fastapi import APIRouter, Depends
-from app.application.pipeline.base import PipelineContext
-from app.application.use_cases.run_my_pipeline import RunMyPipelineUseCase
-from app.core.dependencies import get_my_pipeline_use_case
+from app.application.use_cases.run_example_pipeline import RunExamplePipelineUseCase
+from app.presentation.api.v1.dependencies.my_pipeline import get_run_example_use_case
 
-router = APIRouter(prefix="/pipelines", tags=["pipelines"])
 
-@router.post("/run-my-pipeline")
-async def run_my_pipeline(payload: dict, use_case: RunMyPipelineUseCase = Depends(get_my_pipeline_use_case)):
-    ctx = PipelineContext(input=payload)
-    context = await use_case.execute(ctx)
-    return {"run_id": context.get("_run_id"), "result": context.get("saved_url")}
+router = APIRouter(prefix="/my-pipeline", tags=["my-pipeline"])
+
+
+@router.post("/run")
+async def run_my_pipeline(payload: dict, use_case: RunExamplePipelineUseCase = Depends(get_run_example_use_case)):
+    ctx = await use_case.execute(payload)
+    return {"run_id": ctx.get("_run_id"), "result": ctx.get("example_result")}
 ```
 
-## Checklist tuân thủ Clean/Onion/SOLID:
+```python
+# File: app/application/pipeline/my_pipeline/example_usage.py
+from app.presentation.api.v1.dependencies.my_pipeline import get_run_example_use_case
+import anyio
+
+
+async def main():
+    use_case = get_run_example_use_case()
+    ctx = {"foo": "bar", "n": 3}
+    result_ctx = await use_case.execute(ctx)
+    print(result_ctx.get("example_result"))
+
+
+if __name__ == "__main__":
+    anyio.run(main)
+```
+
+## Best practices
+
+- **SRP for Steps**: each step does one clear thing; name outputs (artifacts) clearly.
+- **Light typing**: consider TypedDict/Pydantic for important artifacts (e.g., `ValidatedData`, `SegmentClip`).
+- **Idempotency and retries**: leverage `BaseStep.retries`, `retry_exceptions`, `timeout` for I/O steps. Temp dir is managed outside `PipelineContext`.
+
+---
+
+## Additional Implementation Notes
+
+- Call `PipelineContext.ensure_run_id()` at the start of a run (already ensured by `Pipeline.execute()`).
+- Main artifact flow:
+  - `validated_data` → `processed_items` → `output_chunks` → `final_output_path` → `final_output_url`.
+- Temp dir/job-scoped resources: managed at Presentation/Infrastructure (see `utils/resource_manager.py`).
+- Builder uses the Adapter Container pattern to manage dependencies in a scalable, type-safe way.
+
+---
+
+## Clean/Onion/SOLID Compliance Checklist
 
 **Dependency Rule (Clean Architecture)**:
 
-- Application layer (Steps, UseCase, Adapter Container) KHÔNG import từ Infrastructure.
+- Application layer (Steps, UseCase, Adapter Container) MUST NOT import from Infrastructure.
 - Infrastructure adapters implement Application interfaces (Ports).
 - Dependencies flow inward: Delivery → Application → Infrastructure.
 
 **Adapter Container Pattern**:
 
-- Container nằm ở Application Layer, chứa Application interfaces (Ports).
-- Infrastructure populate container với concrete implementations.
-- Builder nhận container thay vì individual parameters (giảm parameter explosion).
-- Scalable cho pipelines phức tạp với nhiều adapters.
+- Container lives in the Application Layer and contains Application interfaces (Ports).
+- Infrastructure populates the container with concrete implementations.
+- Builders receive the container instead of many individual parameters (avoids parameter explosion).
+- Scales for complex pipelines with many adapters.
 
 **STRICT Pipeline Assembly**:
 
-- Container validate required adapters tại compile-time (dataclass).
-- DI Provider luôn khởi tạo đủ adapters trước khi build pipeline.
-- Steps nhận adapters qua constructor (Dependency Injection).
-- Optional adapters được handle gracefully trong builder.
+- Container validates required adapters at type-check/definition time (dataclass).
+- DI Provider always initializes required adapters before building the pipeline.
+- Steps receive adapters via constructor (Dependency Injection).
+- Optional adapters are handled gracefully in the builder.
 
 **Single Responsibility (SOLID)**:
 
-- Mỗi Step làm 1 việc rõ ràng, có tên mô tả chức năng.
-- UseCase chỉ điều phối, không chứa business logic chi tiết.
-- Adapters chỉ handle I/O, không chứa business rules.
-- Container chỉ group adapters, không chứa logic.
+- Each Step does one clear job with descriptive naming.
+- UseCase orchestrates only; it does not hold detailed business logic.
+- Adapters handle only I/O, not business rules.
+- Container only groups adapters, no logic inside.
 
 **Data Flow & Context Management**:
 
-- Step đầu gọi `ensure_run_id()` và `ensure_temp_dir()`.
-- Artifacts đặt tên rõ ràng theo flow: input → processing → output.
-- Không ghi đè artifacts tùy tiện, có namespace khi cần.
+- The first step calls `ensure_run_id()`.
+- Name artifacts clearly following the flow: input → processing → output.
+- Do not overwrite artifacts casually; use namespaces when needed.
+
+## Code review checklist (practical)
+
+- [ ] Architecture: No Dependency Rule violations (Application must not import Infrastructure).
+- [ ] Steps: Clear naming, one responsibility per step, validate `required_keys` appropriately.
+- [ ] Retries/Timeouts: Configure `retries`, `retry_exceptions`, `timeout` for I/O-bound steps.
+- [ ] Artifacts: Clear namespacing; avoid accidental overwrites; clean up if needed.
+- [ ] PipelineFactory: Use necessary middlewares (logging, metrics, tracing…).
+- [ ] UseCase: No detailed business logic; orchestrates the pipeline only.
+- [ ] DI Provider: Initialize all required adapters; handle optional adapters in the builder.
+- [ ] Observability: Log with `run_id`; enable `make_logging_middleware` if needed.
+- [ ] Tests: Unit tests for steps; integration tests for pipeline happy-path and common failures.
+
+## Frequently asked questions (FAQs)
+
+- Q: Why is there no `temp_dir` in `PipelineContext`?
+  - A: By design, `temp_dir` belongs to Presentation/Infrastructure; the Context only carries run data and artifacts.
+
+- Q: My step only has `run(context)` and no `__call__`. Can I still use it?
+  - A: Yes. `PipelineFactory` wraps legacy steps with `async run(context)` into callable steps.
+
+- Q: Where should I put artifacts to avoid collisions between pipelines?
+  - A: Use namespaced keys (e.g., `domain.output_chunks`) and avoid sharing artifacts across different pipelines.
+
+- Q: How do I enable detailed logging per step?
+  - A: Use `make_logging_middleware` and initialize `PipelineFactory(middlewares=[...])` in your builder.
+
+- Q: When should I use `fail_fast=False`?
+  - A: When you want to continue less-dependent steps and collect errors; remember to handle failed step status in the result.

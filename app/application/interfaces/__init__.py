@@ -10,6 +10,9 @@ from .image_search import IImageSearch
 from .aligner import ITranscriptionAligner
 from .media_probe import IMediaProbe
 from .image_processor import IImageProcessor
+from .transcript_splitter import ITranscriptSplitter
+from .text_over_builder import ITextOverBuilder
+from .video_adapters import IVideoPipelineAdapters
 
 __all__ = [
     "IStorageRepo",
@@ -25,4 +28,7 @@ __all__ = [
     "ITranscriptionAligner",
     "IMediaProbe",
     "IImageProcessor",
+    "ITranscriptSplitter",
+    "ITextOverBuilder",
+    "IVideoPipelineAdapters",
 ]

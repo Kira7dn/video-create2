@@ -33,7 +33,8 @@ class ConcatenateVideoStep(BaseStep):
         if missing:
             raise ProcessingError(f"Missing clip files for concatenation: {missing}")
 
-        video_id = context.get_run_id() or "video"
+        # Ensure we have a unique run_id even when step is invoked outside Pipeline
+        video_id = context.ensure_run_id()
         filename = f"final_video_{video_id}.mp4"
         output_path = os.path.join("data", "output", filename)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)

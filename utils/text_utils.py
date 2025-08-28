@@ -67,9 +67,10 @@ def merge_consecutive_overlays(
         gap = current["start_time"] - (last["start_time"] + last["duration"])
 
         # Nếu khoảng cách nhỏ hơn ngưỡng, hợp nhất
-        if gap <= max_gap and last["text"].endswith((".", "!", "?")) == current[
-            "text"
-        ].startswith((" ", "\n")):
+        if gap <= max_gap and (
+            last["text"].endswith((".", "!", "?"))
+            or current["text"].startswith((" ", "\n"))
+        ):
             last["text"] += " " + current["text"].lstrip()
             last["duration"] = (current["start_time"] + current["duration"]) - last[
                 "start_time"

@@ -10,8 +10,18 @@ from app.core.config import settings
 class CreateSegmentClipsStep(BaseStep):
     name = "create_segment_clips"
     required_keys = ["segments"]
+
     def __init__(self, renderer: IVideoRenderer):
         self.renderer = renderer
+        # Renderer operations can be flaky/slow; set conservative retry/timeout
+        self.retries = int(getattr(settings, "create_clips_retries", 1))
+        self.retry_backoff = float(getattr(settings, "create_clips_retry_backoff", 0.5))
+        self.max_backoff = float(getattr(settings, "create_clips_max_backoff", 3.0))
+        self.jitter = float(getattr(settings, "create_clips_jitter", 0.2))
+        self.use_exponential_backoff = bool(
+            getattr(settings, "create_clips_use_exp_backoff", True)
+        )
+        self.timeout = getattr(settings, "create_clips_timeout", None)
 
     async def _build_specification(
         self,
@@ -210,7 +220,7 @@ class CreateSegmentClipsStep(BaseStep):
         clips = []
         for idx, seg in enumerate(segments):
             # Let adapter handle temp_dir and file extensions
-            out_path = f"segment_{idx:03d}"
+            seg_id = seg.get("id", f"seg_{idx}")
             # Resolve defaults from settings
             canvas_width, canvas_height = settings.video_resolution_tuple
             frame_rate = getattr(settings, "video_default_fps", 30)
@@ -219,7 +229,7 @@ class CreateSegmentClipsStep(BaseStep):
             )
             clip_out = await self.renderer.process_with_specification(
                 specification,
-                target_path=out_path,
+                seg_id=seg_id,
                 canvas_width=canvas_width,
                 canvas_height=canvas_height,
                 frame_rate=frame_rate,

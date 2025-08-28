@@ -9,6 +9,7 @@ class ITranscriptionAligner(Protocol):
     def align(
         self,
         audio_path: str,
+        words_id: str,
         transcript_text: str,
         *,
         min_success_ratio: float = 0.8,

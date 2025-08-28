@@ -30,8 +30,10 @@ class PydanticAIKeywordAgent(IKeywordAgent):
 
     def _initialize(self) -> None:
         if not settings.openai_api_key or not settings.ai_keyword_extraction_enabled:
-            logger.debug(
-                "PydanticAIKeywordAgent: AI disabled or missing API key; running in fallback mode"
+            logger.info(
+                "PydanticAIKeywordAgent: using FALLBACK (ai_enabled=%s, has_api_key=%s)",
+                settings.ai_keyword_extraction_enabled,
+                bool(settings.openai_api_key),
             )
             return
         try:
@@ -48,11 +50,11 @@ class PydanticAIKeywordAgent(IKeywordAgent):
                     "Extract 4-8 multi-word phrases optimized for Pixabay."
                 ),
             )
-            logger.info("🤖 PydanticAIKeywordAgent initialized")
+            logger.info("🤖 PydanticAIKeywordAgent: using OPENAI model=%s", self._model_name)
         except Exception as e:  # noqa: BLE001
             self._init_exception = e
             self._agent = None
-            logger.warning("PydanticAIKeywordAgent init failed: %s", e)
+            logger.warning("PydanticAIKeywordAgent init failed, falling back: %s", e)
 
     async def extract_keywords(
         self,
@@ -65,6 +67,7 @@ class PydanticAIKeywordAgent(IKeywordAgent):
 
         # If disabled/unavailable, return fields (truncated)
         if not settings.ai_keyword_extraction_enabled or self._agent is None:
+            logger.info("PydanticAIKeywordAgent.extract_keywords: using FALLBACK")
             return fields[:max_keywords]
 
         try:
@@ -72,8 +75,9 @@ class PydanticAIKeywordAgent(IKeywordAgent):
                 f"Extract image search keywords from this content: '{content}' "
                 f"with these related fields: [{', '.join(fields)}]"
             )
+            logger.info("PydanticAIKeywordAgent.extract_keywords: using OPENAI")
             result = await self._agent.run(user_prompt=user_prompt)  # type: ignore[attr-defined]
             return list(result.output.keywords)[:max_keywords]
         except Exception as e:  # noqa: BLE001
-            logger.warning("PydanticAIKeywordAgent.extract_keywords failed: %s", e)
+            logger.warning("PydanticAIKeywordAgent.extract_keywords failed, falling back: %s", e)
             return fields[:max_keywords]

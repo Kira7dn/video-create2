@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Sequence
+from pathlib import Path
 
 from app.application.interfaces.image_processor import IImageProcessor
 from utils.image_utils import process_image
@@ -17,6 +18,7 @@ class ImageProcessor(IImageProcessor):
         *,
         target_width: int,
         target_height: int,
+        seg_id: str | None = None,
         smart_pad_color: bool = True,
         pad_color_method: str = "average_edge",
         auto_enhance: bool = True,
@@ -25,6 +27,12 @@ class ImageProcessor(IImageProcessor):
         enhance_saturation: bool = True,
     ) -> Sequence[str]:
         def _run():
+            # Compute output directory; per-segment folder if seg_id provided
+            if seg_id:
+                out_dir = Path(self.temp_dir) / seg_id
+            else:
+                out_dir = Path(self.temp_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
             return process_image(
                 image_paths=image_path,
                 target_size=(target_width, target_height),
@@ -34,7 +42,7 @@ class ImageProcessor(IImageProcessor):
                 enhance_brightness=enhance_brightness,
                 enhance_contrast=enhance_contrast,
                 enhance_saturation=enhance_saturation,
-                output_dir=self.temp_dir,
+                output_dir=str(out_dir),
             )
 
         return await asyncio.to_thread(_run)
