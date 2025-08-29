@@ -37,5 +37,5 @@ ENV PYTHONPATH=/app \
 # Expose port
 EXPOSE 8000
 
-# Run FastAPI with production settings
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--access-log"]
+# Run FastAPI with production settings (correct module path + proxy headers)
+CMD ["uvicorn", "app.presentation.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--access-log", "--proxy-headers", "--forwarded-allow-ips=*"]
