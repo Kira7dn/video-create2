@@ -118,6 +118,10 @@ htmlcov/
 .mypy_cache/
 .python-version
 .pytest_cache/
+
+# Runtime artifacts
+uvicorn.out
+uvicorn.pid
 .mypy_cache/
 .coverage.*
 coverage.xml
