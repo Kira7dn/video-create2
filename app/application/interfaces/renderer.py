@@ -10,9 +10,18 @@ class IVideoRenderer(Protocol):
         pass
 
     async def concat_clips(
-        self, inputs: Sequence[str], *, output_path: str, transition: str | None = None
+        self,
+        inputs: Sequence[str],
+        *,
+        output_path: str,
+        transition: str | None = None,
+        background_music: dict | None = None,
     ) -> str:
-        """Concatenate input clips with optional transition, returning output path."""
+        """Concatenate input clips with optional transition and background music.
+
+        background_music: optional dict with keys like 'local_path', 'start_delay', 'end_delay'.
+        Implementations may ignore if None.
+        """
         pass
 
     # Primitive operations

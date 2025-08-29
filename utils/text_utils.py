@@ -318,10 +318,10 @@ def create_text_over_item(text: str, word_items: List[Dict]) -> Optional[Dict]:
     if not valid_words:
         return None
 
-    # Tính toán thời gian bắt đầu và kết thúc
+    # Tính toán thời gian bắt đầu và kết thúc (dựa theo span tự nhiên của nhóm từ)
     start_time = min(w["start"] for w in valid_words)
     end_time = max(w["end"] for w in valid_words)
-    duration = max(0.1, end_time - start_time)  # Đảm bảo duration > 0
+    duration = max(0.1, end_time - start_time)
 
     return {
         "text": text,

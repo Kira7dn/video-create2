@@ -41,11 +41,24 @@ class ConcatenateVideoStep(BaseStep):
 
         # Optional transition policy (e.g., "fade", "none"), passed through to renderer
         transition = context.get("concat_transition")
+        # Optional background music downloaded earlier in pipeline (dict with local_path, start_delay, end_delay, ...)
+        background_music = context.get("background_music")
 
         logger.info("Concatenating %d clips -> %s", len(clip_paths), output_path)
-        await self.renderer.concat_clips(
-            clip_paths, output_path=output_path, transition=transition
-        )
+        supports_bgm = bool(getattr(self.renderer, "SUPPORTS_BACKGROUND_MUSIC", False))
+        if supports_bgm and background_music:
+            await self.renderer.concat_clips(
+                clip_paths,
+                output_path=output_path,
+                transition=transition,
+                background_music=background_music,
+            )
+        else:
+            await self.renderer.concat_clips(
+                clip_paths,
+                output_path=output_path,
+                transition=transition,
+            )
 
         # Verify output exists
         if not os.path.exists(output_path):

@@ -11,6 +11,8 @@ from utils.subprocess_utils import safe_subprocess_run
 
 
 class FFMpegVideoRenderer(IVideoRenderer):
+    # Compatibility flag so pipeline steps can detect and pass background_music safely
+    SUPPORTS_BACKGROUND_MUSIC: bool = True
     """Renderer backed by existing VideoProcessor and ffmpeg utilities."""
 
     def __init__(self, *, temp_dir: str | None = None) -> None:
@@ -39,7 +41,12 @@ class FFMpegVideoRenderer(IVideoRenderer):
         return await asyncio.to_thread(_probe)
 
     async def concat_clips(
-        self, inputs: Sequence[str], *, output_path: str, transition: str | None = None
+        self,
+        inputs: Sequence[str],
+        *,
+        output_path: str,
+        transition: str | None = None,
+        background_music: dict | None = None,
     ) -> str:
         # Build segment dicts for our helper
         segments = []
@@ -53,7 +60,7 @@ class FFMpegVideoRenderer(IVideoRenderer):
             segments,
             output_path,
             temp_dir=temp_dir,
-            background_music=None,
+            background_music=background_music,
         )
         return output_path
 
@@ -273,10 +280,23 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 else:
                     audio_filters.append(f"afade=t=out:st={st}:d={d}")
 
+        # Pass 1: apply audio_delay first (before any afade)
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            if op.get("op") == "audio_delay":
+                ms = int(op.get("milliseconds", 0))
+                if ms > 0:
+                    # duplicate for stereo channels
+                    audio_filters.append(f"adelay={ms}|{ms}")
+
+        # Pass 2: process remaining ops in order (excluding audio_delay)
         for op in ops:
             if not isinstance(op, dict):
                 continue
             kind = op.get("op")
+            if kind == "audio_delay":
+                continue
             if kind == "pixel_format":
                 fmt = op.get("format") or "yuv420p"
                 video_filters.append(f"format={fmt}")
@@ -580,6 +600,11 @@ class FFMpegVideoRenderer(IVideoRenderer):
             elif transform_type == "audio_normalize":
                 # Map to audio padding
                 ops.append({"op": "audio_pad"})
+            elif transform_type == "audio_delay":
+                # Pass through to renderer as an op with milliseconds
+                ms = int(transform.get("milliseconds", 0) or 0)
+                if ms > 0:
+                    ops.append({"op": "audio_delay", "milliseconds": ms})
             elif transform_type == "transition":
                 # Map abstract transition to concrete fade
                 target = "video" if transform.get("target") == "visual" else "audio"

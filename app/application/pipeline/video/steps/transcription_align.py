@@ -82,10 +82,12 @@ class TranscriptionAlignStep(BaseStep):
             # Try alignment if audio available
             if audio_path and Path(audio_path).exists():
                 try:
+                    # Use the chunked transcript (joined) for alignment to match builder behavior
+                    transcript_for_alignment: str = " ".join(chunks).strip() if chunks else content
                     word_items, verify = self.aligner.align(
                         audio_path=str(audio_path),
                         words_id=seg_id,
-                        transcript_text=content,
+                        transcript_text=transcript_for_alignment,
                         min_success_ratio=getattr(
                             settings, "alignment_min_success_ratio", 0.8
                         ),

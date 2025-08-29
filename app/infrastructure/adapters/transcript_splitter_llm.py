@@ -23,10 +23,6 @@ class _TranscriptSegments(BaseModel):
     @field_validator("segments", mode="after")
     @classmethod
     def _validate_segments(cls, v: List) -> List[str]:
-        if v is None:
-            return []
-        if not isinstance(v, list):
-            raise ValueError("segments must be a list")
         for item in v:
             if not isinstance(item, str):
                 raise ValueError("string_type: segment must be a string")
@@ -60,25 +56,32 @@ class LLMTranscriptSplitter(ITranscriptSplitter):
             system_prompt="""You are a natural language processing expert.
             Your task is to segment the transcript into short, natural sentences.
             Each sentence must be a complete semantic unit, readable and natural.
-            CRITICAL: You MUST preserve EVERY SINGLE WORD from the original transcript.
-            DO NOT paraphrase, summarize, or change ANY words.
+
+            CRITICAL RULES (MUST FOLLOW EXACTLY):
+            - Preserve the original text EXACTLY. Do not add, remove, or replace ANY characters.
+            - Do NOT expand or contract words. Keep contractions and apostrophes exactly as written (e.g., "you're" must stay "you're").
+            - Do NOT normalize punctuation, whitespace, or casing. Keep original punctuation and case. Only insert segment breaks.
+            - Do NOT paraphrase, summarize, or reorder words.
+            - Your output must be a list of segments that, when concatenated with a single space between segments, contains EXACTLY the same characters as the original input (ignoring only the inserted segment boundaries).
             """,
             model_settings={"temperature": 0.1},
         )
 
         prompt = f"""
-            CRITICAL: You MUST preserve EVERY SINGLE WORD from the original transcript.
-            DO NOT paraphrase, summarize, or change ANY words. Your job is ONLY to split the text.
+            CRITICAL: Preserve the original text EXACTLY.
+            - Do NOT change words, punctuation, apostrophes, contractions, spacing, or casing.
+            - Do NOT expand contractions ("you're" must remain "you're").
+            - Your job is ONLY to insert segment boundaries; do not modify the content itself.
 
             Original transcript (PRESERVE EXACTLY):
             "{content}"
 
             REQUIREMENTS:
-            1. PRESERVE ALL CONTENT - Every word must be included exactly as written
-            2. Each segment: 4-12 words (readable chunks)
-            3. Maximum 80 characters per segment (screen readability)
-            4. Break at natural phrase boundaries
-            5. Keep related concepts together
+            1. Preserve ALL content exactly as written (characters and order unchanged).
+            2. Each segment: 4-12 words (readable chunks).
+            3. Maximum 80 characters per segment (screen readability).
+            4. Break at natural phrase boundaries; keep related concepts together.
+            5. Output segments such that, when joined (with single spaces between segments), they reconstruct the original text exactly aside from the inserted breaks.
             6. Perfect for video text overlay (3-6 seconds per segment)
 
             Example of good segmentation:
@@ -128,8 +131,6 @@ class LLMTranscriptSplitter(ITranscriptSplitter):
 
             if not original_tokens:
                 reason = "Original tokens are empty"
-            elif not segments:
-                reason = "Segments are empty"
             else:
                 missing = set(original_tokens) - set(segmented_tokens)
                 extra = set(segmented_tokens) - set(original_tokens)

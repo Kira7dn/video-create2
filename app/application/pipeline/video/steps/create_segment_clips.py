@@ -73,7 +73,9 @@ class CreateSegmentClipsStep(BaseStep):
             if voice_path:
                 try:
                     voice_len = await self.renderer.get_media_duration(voice_path)
-                    original_duration = max(base_duration, float(voice_len))
+                    # Include start_delay so fade-out starts after delayed voice end
+                    start_delay_for_len = float((voice_over or {}).get("start_delay", 0) or 0)
+                    original_duration = max(base_duration, float(voice_len) + start_delay_for_len)
                 except Exception:
                     original_duration = base_duration
             else:
@@ -159,7 +161,19 @@ class CreateSegmentClipsStep(BaseStep):
             if input_type == "video"
             else fade_in_duration + original_duration + fade_out_duration
         )
-        delay = fade_in_duration + (voice_over.get("start_delay", 0) or 0)
+        # Delay components
+        start_delay = float(voice_over.get("start_delay", 0) or 0)
+        delay = fade_in_duration + start_delay
+
+        # If audio has a configured delay, emit an explicit audio delay transform (ms)
+        # voice_delay = fade_in_duration + start_delay
+        if delay > 0:
+            transformations.append(
+                {
+                    "type": "audio_delay",
+                    "milliseconds": int(round(delay * 1000)),
+                }
+            )
 
         # Text overlays (processor-agnostic)
         text_overlays: list[dict] = []
@@ -167,19 +181,25 @@ class CreateSegmentClipsStep(BaseStep):
         if text_overs:
             if not isinstance(text_overs, list):
                 raise RuntimeError("text_over must be an array of objects")
+            # Track previous overlay end (segment timeline, before applying delay)
+            prev_end = 0.0
             for item in text_overs:
                 if not isinstance(item, dict):
                     continue
                 text = str(item.get("text", ""))
                 if not text:
                     continue
-                start = float(item.get("start", 0) or 0) + delay
+                raw_start = item.get("start_time", None)
+                if raw_start is None:
+                    raw_start = prev_end
+                start = float(raw_start) + delay
                 dur = float(item.get("duration", total_duration))
                 end = min(total_duration, start + dur)
                 fontsize = int(item.get("font_size", 42))
                 color = item.get("color", "white")
+                # Default position: bottom-center with safe margin
                 x = item.get("x", "(w-text_w)/2")
-                y = item.get("y", "(h-text_h)/2")
+                y = item.get("y", "h-text_h-0.08*h")
                 box = item.get("box", True)
                 boxcolor = item.get("boxcolor", "black@0.4")
                 text_overlays.append(
@@ -199,6 +219,8 @@ class CreateSegmentClipsStep(BaseStep):
                         "background": {"enabled": bool(box), "color": boxcolor},
                     }
                 )
+                # Update prev_end in segment timeline (remove delay component)
+                prev_end = max(0.0, end - delay)
 
         if text_overlays:
             transformations.extend(text_overlays)
