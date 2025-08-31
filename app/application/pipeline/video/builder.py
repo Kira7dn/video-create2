@@ -37,7 +37,7 @@ def build_video_pipeline_via_container(
     )
     factory.add(
         TranscriptionAlignStep(
-            adapters.aligner, adapters.splitter, adapters.text_over_builder
+            adapters.splitter, adapters.aligner, adapters.text_over_builder
         )
     )
     factory.add(CreateSegmentClipsStep(adapters.renderer))

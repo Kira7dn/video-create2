@@ -27,15 +27,12 @@ class TranscriptionAlignStep(BaseStep):
 
     def __init__(
         self,
-        aligner: ITranscriptionAligner,
         splitter: ITranscriptSplitter,
+        aligner: ITranscriptionAligner,
         builder: ITextOverBuilder,
     ) -> None:
-        # Adapter for alignment (Gentle or alternative)
-        self.aligner = aligner
-        # Adapter for transcript splitting (LLM or custom)
         self.splitter = splitter
-        # Adapter for building text_over items
+        self.aligner = aligner
         self.builder = builder
         self.logger = logging.getLogger(__name__)
 
@@ -58,18 +55,20 @@ class TranscriptionAlignStep(BaseStep):
             content: str = (voice or {}).get("content") or ""
             audio_path: Optional[str] = (voice or {}).get("local_path")
             seg_id = seg.get("id")
+            self.logger.info(
+                f"TranscriptionAlignStep: Processing segment {seg_id} with content: {content}"
+            )
 
             # Default: no text_over
             seg_out["text_over"] = []
+            chunks: List[str] = []
 
             # Split transcript into readable chunks via injected splitter with robust fallback
             if content:
                 try:
                     chunks: List[str] = await self.splitter.split(content, seg_id)
                 except Exception:
-                    chunks = []
-            else:
-                chunks = []
+                    pass
 
             # If no content at all, move on
             if not content:
@@ -83,7 +82,9 @@ class TranscriptionAlignStep(BaseStep):
             if audio_path and Path(audio_path).exists():
                 try:
                     # Use the chunked transcript (joined) for alignment to match builder behavior
-                    transcript_for_alignment: str = " ".join(chunks).strip() if chunks else content
+                    transcript_for_alignment: str = (
+                        " ".join(chunks).strip() if chunks else content
+                    )
                     word_items, verify = self.aligner.align(
                         audio_path=str(audio_path),
                         words_id=seg_id,
@@ -102,12 +103,20 @@ class TranscriptionAlignStep(BaseStep):
                         "total_words": 0,
                     }
 
-            # Build text_over items via adapter
-            text_over_items: List[Dict[str, Any]] = self.builder.build(
-                word_items=word_items,
-                chunks=chunks,
-                text_over_id=seg_id,
-            )
+            # Build text_over items via adapter (graceful fallback if alignment missing)
+            text_over_items: List[Dict[str, Any]] = []
+            try:
+                text_over_items = self.builder.build(
+                    word_items=word_items,
+                    chunks=chunks,
+                    text_over_id=seg_id,
+                )
+            except ValueError:
+                # alignment_required path: fall back to chunk-only rendering
+                pass
+            except Exception:
+                # Any other unexpected builder error, attempt fallback
+                pass
 
             # Safety: if builder produced no items but we have content, synthesize fallback
             if not text_over_items and content:

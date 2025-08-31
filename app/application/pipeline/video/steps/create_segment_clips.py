@@ -74,8 +74,12 @@ class CreateSegmentClipsStep(BaseStep):
                 try:
                     voice_len = await self.renderer.get_media_duration(voice_path)
                     # Include start_delay so fade-out starts after delayed voice end
-                    start_delay_for_len = float((voice_over or {}).get("start_delay", 0) or 0)
-                    original_duration = max(base_duration, float(voice_len) + start_delay_for_len)
+                    start_delay_for_len = float(
+                        (voice_over or {}).get("start_delay", 0) or 0
+                    )
+                    original_duration = max(
+                        base_duration, float(voice_len) + start_delay_for_len
+                    )
                 except Exception:
                     original_duration = base_duration
             else:
@@ -177,7 +181,7 @@ class CreateSegmentClipsStep(BaseStep):
 
         # Text overlays (processor-agnostic)
         text_overlays: list[dict] = []
-        text_overs = seg.get("text_over")
+        text_overs = seg.get("text_over", None)
         if text_overs:
             if not isinstance(text_overs, list):
                 raise RuntimeError("text_over must be an array of objects")

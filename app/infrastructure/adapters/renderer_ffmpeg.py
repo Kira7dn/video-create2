@@ -326,7 +326,10 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 target = op.get("target", "video")
                 add_fade(target, op)
             elif kind == "draw_text":
-                text = str(op.get("text", "")).replace(":", "\\:").replace("'", "\\'")
+                # Prefer robust handling of newlines: if multiline, render each line as a separate drawtext
+                raw_text = str(op.get("text", ""))
+                # Normalize literal "\\n" to real newlines for processing
+                file_text = raw_text.replace("\\n", "\n")
                 start = float(op.get("start", 0))
                 dur = float(op.get("duration", 0))
                 end = start + dur if dur > 0 else start
@@ -359,13 +362,36 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 box_enabled = 1 if box.get("enabled", True) else 0
                 boxcolor = box.get("color", "black@0.4")
                 enable = f"between(t,{start},{end})"
-                video_filters.append(
-                    "drawtext="
-                    f"fontfile='{fontfile}':text='{text}':"
-                    f"fontcolor={color}:fontsize={fontsize}:x={x}:y={y}:"
-                    f"box={box_enabled}:boxcolor={boxcolor}:"
-                    f"enable='{enable}'"
-                )
+                # If multiline, render each line independently so each one is horizontally centered
+                if "\n" in file_text:
+                    lines = file_text.splitlines()
+                    # Force center x for multiline to avoid caller-provided absolute x causing left alignment
+                    x_center = "(w-text_w)/2"
+                    for i, line in enumerate(lines):
+                        line_text = (
+                            line.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+                        )
+                        # Increment y per line by approx line height (fontsize + small gap)
+                        y_i = f"{y}+{i}*({fontsize}+8)"
+                        video_filters.append(
+                            "drawtext="
+                            f"fontfile='{fontfile}':text='{line_text}':"
+                            f"fontcolor={color}:fontsize={fontsize}:x={x_center}:y={y_i}:"
+                            f"box={box_enabled}:boxcolor={boxcolor}:"
+                            f"enable='{enable}'"
+                        )
+                else:
+                    # Single-line: use inline text (simpler and avoids extra files)
+                    text_inline = (
+                        file_text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+                    )
+                    video_filters.append(
+                        "drawtext="
+                        f"fontfile='{fontfile}':text='{text_inline}':"
+                        f"fontcolor={color}:fontsize={fontsize}:x={x}:y={y}:"
+                        f"box={box_enabled}:boxcolor={boxcolor}:"
+                        f"enable='{enable}'"
+                    )
 
         total_duration = float(plan.get("duration", 4.0))
         if input_type == "video":
@@ -578,6 +604,47 @@ class FFMpegVideoRenderer(IVideoRenderer):
         # Always ensure proper pixel format for video output
         ops.append({"op": "pixel_format", "format": "yuv420p"})
 
+        # Helper: wrap long text into multiple lines using a simple width heuristic
+        def _wrap_text_to_width(text: str, fontsize: int, max_width_pct: float = 0.9) -> str:
+            """Wrap text into multiple lines so the longest line width ~= canvas_width * max_width_pct.
+
+            Heuristic: avg_char_width ≈ fontsize * 0.6 (works reasonably for Roboto Black).
+            We return lines joined with '\n' so drawtext renders multi-line without changing fontsize.
+            """
+            try:
+                t = (text or "").strip()
+                if not t:
+                    return ""
+                # Avoid pathological small/large values
+                fs = max(8, int(fontsize or 42))
+                avg_char_w = max(4.0, fs * 0.6)
+                target_w = max(50.0, canvas_width * float(max_width_pct))
+                max_chars = max(8, int(target_w / avg_char_w))
+
+                words = t.split()
+                if not words:
+                    return t
+                lines: list[str] = []
+                cur: list[str] = []
+                cur_len = 0
+                for w in words:
+                    add_len = len(w) + (1 if cur else 0)
+                    if cur_len + add_len <= max_chars:
+                        cur.append(w)
+                        cur_len += add_len
+                    else:
+                        if cur:
+                            lines.append(" ".join(cur))
+                        cur = [w]
+                        cur_len = len(w)
+                if cur:
+                    lines.append(" ".join(cur))
+                # Join with \n for ffmpeg drawtext (we pass a literal backslash-n)
+                return "\\n".join(lines)
+            except Exception:
+                # On any error, return original text
+                return text
+
         for transform in transformations:
             if not isinstance(transform, dict):
                 continue
@@ -621,11 +688,15 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 appearance = transform.get("appearance", {})
                 layout = transform.get("layout", {})
                 background = transform.get("background", {})
+                # Compute fontsize now for wrapping heuristic
+                fontsize_for_wrap = int(appearance.get("size", 42))
+                max_width_pct = float(layout.get("max_width_pct", 0.9))
+                wrapped = _wrap_text_to_width(str(content), fontsize_for_wrap, max_width_pct)
 
                 ops.append(
                     {
                         "op": "draw_text",
-                        "text": content,
+                        "text": wrapped,
                         "start": float(timing.get("start", 0)),
                         "duration": float(timing.get("duration", 0)),
                         "style": {

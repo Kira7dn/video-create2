@@ -8,6 +8,7 @@ transitions, and audio mixing using FFmpeg.
 import json
 import os
 import re
+import math
 import shutil
 from typing import List, Optional, Dict, Any
 
@@ -62,35 +63,6 @@ def ffmpeg_concat_videos(
             if logger:
                 logger.error(error_msg)
             raise VideoProcessingError(error_msg) from e
-
-    def get_mean_volume(audio_path):
-        cmd = [
-            "ffmpeg",
-            "-i",
-            audio_path,
-            "-af",
-            "volumedetect",
-            "-vn",
-            "-sn",
-            "-dn",
-            "-f",
-            "null",
-            "NUL" if os.name == "nt" else "/dev/null",
-        ]
-        try:
-            result = safe_subprocess_run(
-                cmd, f"Get mean volume for {audio_path}", logger
-            )
-            if not result or not result.stderr:
-                return None
-            match = re.search(r"mean_volume:\s*(-?\d+(\.\d+)?) dB", result.stderr)
-            if match:
-                return float(match.group(1))
-            return None
-        except (OSError, SubprocessError, ValueError) as e:
-            if logger:
-                logger.warning(f"Failed to get mean volume for {audio_path}: {e}")
-            return None
 
     def validate_inputs():
         """Validate input parameters"""
@@ -158,33 +130,100 @@ def ffmpeg_concat_videos(
         bgm_path = background_music.get("local_path")
         start_delay = float(background_music.get("start_delay", 0) or 0)
         video_duration = get_duration(temp_path)
-        # Auto adjust bgm volume based on mean_volume
+        if logger:
+            logger.info("🔈 Auto-volume: loudnorm (default)")
+
+        # Always pre-normalize BGM using EBU R128 loudness (two-pass when possible)
+        # Hardcoded targets as requested
+        target_i = -16.0  # LUFS
+        target_tp = -1.5  # dBTP
+        target_lra = 11.0  # LU
+
+        def _analyze_loudness(path: str) -> Optional[dict]:
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-i",
+                path,
+                "-af",
+                f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:print_format=json",
+                "-f",
+                "null",
+                "NUL" if os.name == "nt" else "/dev/null",
+            ]
+            try:
+                res = safe_subprocess_run(cmd, f"Loudnorm analyze for {path}", logger)
+                text = (res.stderr or "") + (res.stdout or "")
+                # Extract last JSON object in output (ffmpeg prints to stderr)
+                matches = list(re.finditer(r"\{[\s\S]*?\}", text))
+                if not matches:
+                    return None
+                data = json.loads(matches[-1].group(0))
+                needed = {
+                    "input_i": data.get("input_i"),
+                    "input_lra": data.get("input_lra"),
+                    "input_tp": data.get("input_tp"),
+                    "input_thresh": data.get("input_thresh"),
+                    "target_offset": data.get("target_offset"),
+                }
+                if all(v is not None for v in needed.values()):
+                    return needed
+                return None
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Loudnorm analyze failed: {e}")
+                return None
+
+        analysis = _analyze_loudness(bgm_path)
         try:
-            video_mean_volume = get_mean_volume(temp_path)
-            music_mean_volume = get_mean_volume(bgm_path)
-            if video_mean_volume is not None and music_mean_volume is not None:
-                diff_db = video_mean_volume - music_mean_volume
-                bgm_volume_factor = 10 ** (diff_db / 20)
-                bgm_volume_factor = max(0.1, min(bgm_volume_factor, 0.5))
-                if logger:
-                    log_msg = (
-                        f"🔊 Auto-adjusted bgm volume factor: {bgm_volume_factor:.2f}"
-                    )
-                    log_msg += f" (video_mean={video_mean_volume}dB, "
-                    log_msg += f"music_mean={music_mean_volume}dB)"
-                    logger.info(log_msg)
-            else:
-                bgm_volume_factor = bgm_volume
-                if logger:
-                    logger.warning(
-                        "⚠️ Could not auto-detect mean_volume, using default bgm volume 0.2"
-                    )
-        except (OSError, SubprocessError, ValueError) as e:
-            bgm_volume_factor = bgm_volume
-            if logger:
-                logger.warning(
-                    f"⚠️ Error auto-adjusting bgm volume: {e}, using default 0.2"
+            normalized_bgm_path = os.path.join(temp_dir, "bgm_loudnorm.wav")
+            if analysis:
+                # Two-pass with measured values
+                ln_filter = (
+                    "loudnorm="
+                    f"I={target_i}:TP={target_tp}:LRA={target_lra}:"
+                    f"measured_I={analysis['input_i']}:"
+                    f"measured_LRA={analysis['input_lra']}:"
+                    f"measured_TP={analysis['input_tp']}:"
+                    f"measured_thresh={analysis['input_thresh']}:"
+                    f"offset={analysis['target_offset']}:"
+                    "linear=true:print_format=summary"
                 )
+            else:
+                # Fallback to single-pass loudnorm
+                ln_filter = (
+                    "loudnorm="
+                    f"I={target_i}:TP={target_tp}:LRA={target_lra}:"
+                    "linear=true:print_format=summary"
+                )
+            cmd_norm = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                bgm_path,
+                "-af",
+                ln_filter,
+                "-vn",
+                "-acodec",
+                "pcm_s16le",
+                normalized_bgm_path,
+            ]
+            safe_subprocess_run(cmd_norm, "Normalize BGM loudness", logger)
+            if logger:
+                logger.info(
+                    f"🎚️ BGM loudness normalized to I={target_i} LUFS, TP={target_tp} dB"
+                )
+            bgm_path = normalized_bgm_path
+        except Exception as e:
+            if logger:
+                logger.warning(f"Loudnorm normalization failed, continue without: {e}")
+            normalized_bgm_path = None
+
+        # Mix level for BGM after normalization (no auto detection needed)
+        try:
+            bgm_volume_factor = float(background_music.get("bgm_volume", bgm_volume))
+        except (TypeError, ValueError):
+            bgm_volume_factor = bgm_volume
         # Prepare filter for bgm: delay, trim, volume
         # Calculate actual BGM play duration considering both start_delay and end_delay
         end_delay = float(background_music.get("end_delay", 0) or 0)
@@ -233,10 +272,27 @@ def ffmpeg_concat_videos(
 
         # Compose filter_complex for direct mix
         # Use 'duration=first' to tie mixed audio to the video audio (0:a)
-        filter_complex = (
-            f"[1:a]{bgm_filter}[bgm]; "
-            f"[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-        )
+        # Add optional ducking via sidechaincompress (default: enabled)
+        # Final limiter to avoid clipping
+        enable_ducking = bool(background_music.get("ducking", True))
+        if enable_ducking and logger:
+            logger.info("🪝 Ducking enabled (sidechaincompress)")
+
+        if enable_ducking:
+            # Music as main input, video audio (0:a) as sidechain key
+            filter_complex = (
+                f"[1:a]{bgm_filter}[bgm]; "
+                # Stronger ducking: lower threshold, higher ratio, faster attack, longer release
+                f"[bgm][0:a]sidechaincompress=threshold=-35dB:ratio=20:attack=5:release=400:knee=8:link=average:level_sc=1:mix=1[bgmsc]; "
+                f"[0:a][bgmsc]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,"
+                f"alimiter=limit=0.95[aout]"
+            )
+        else:
+            filter_complex = (
+                f"[1:a]{bgm_filter}[bgm]; "
+                f"[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,"
+                f"alimiter=limit=0.95[aout]"
+            )
         temp_final_with_bgm = os.path.join(temp_dir, "final_with_bgm.mp4")
         ffmpeg_mix_cmd = [
             "ffmpeg",
@@ -249,32 +305,32 @@ def ffmpeg_concat_videos(
 
         # If we know bgm duration and it's shorter than desired play, loop the input enough times
         if bgm_src_duration and bgm_src_duration > 0 and bgm_play_duration > 0:
-            import math
-
             loops_needed = max(0, math.ceil(bgm_play_duration / bgm_src_duration) - 1)
             if loops_needed > 0:
                 ffmpeg_mix_cmd.extend(["-stream_loop", str(loops_needed)])
 
-        ffmpeg_mix_cmd.extend([
-            "-i",
-            bgm_path,
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "0:v",
-            "-map",
-            "[aout]",
-            "-c:v",
-            "libx264",
-            "-profile:v",
-            "high",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-shortest",
-            temp_final_with_bgm,
-        ])
+        ffmpeg_mix_cmd.extend(
+            [
+                "-i",
+                bgm_path,
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "0:v",
+                "-map",
+                "[aout]",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+                temp_final_with_bgm,
+            ]
+        )
         if logger:
             logger.info(f"Mixing BGM (atomic operation): {' '.join(ffmpeg_mix_cmd)}")
         safe_subprocess_run(ffmpeg_mix_cmd, "Background music mixing", logger)

@@ -2,17 +2,20 @@ import os
 import uuid
 import json
 import logging
+from typing import Callable
 from filelock import FileLock
 from fastapi import APIRouter, UploadFile, File, BackgroundTasks, HTTPException, Depends
 from app.presentation.api.v1.schemas.video import JobQueuedResponse
 from app.core.config import settings
 from app.application.use_cases.video_create import CreateVideoUseCase
-from app.presentation.api.v1.dependencies.video import get_create_video_use_case
+from app.presentation.api.v1.dependencies.video import (
+    get_create_video_use_case_factory,
+)
 from utils.resource_manager import managed_temp_directory
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/videos")
+router = APIRouter(prefix="/video")
 
 # Job store paths
 JOB_STORE_PATH = os.path.join("data", "job_store.json")
@@ -37,11 +40,13 @@ def save_job_store(job_store):
             json.dump(job_store, f)
 
 
-@router.post("", response_model=JobQueuedResponse)
+@router.post("/create", response_model=JobQueuedResponse)
 async def create_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    use_case: CreateVideoUseCase = Depends(get_create_video_use_case),
+    use_case_factory: Callable[[str | None], CreateVideoUseCase] = Depends(
+        get_create_video_use_case_factory
+    ),
 ):
     """Queue a job to create a video from uploaded JSON configuration."""
     job_id = str(uuid.uuid4())
@@ -79,8 +84,18 @@ async def create_video(
             async with managed_temp_directory(
                 prefix=settings.temp_batch_dir + "_"
             ) as temp_dir:
+                # Persist original input for this job
+                logger.info(f"Persisting original input for job {job_id} at {temp_dir}")
+                try:
+                    input_json_path = os.path.join(temp_dir, "input.json")
+                    with open(input_json_path, "w", encoding="utf-8") as f:
+                        json.dump(json_data, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    logger.warning(
+                        "Failed to write input.json to temp_dir", exc_info=True
+                    )
                 # Re-compose use case with job-scoped temp_dir so infra writes there
-                uc_scoped = get_create_video_use_case(temp_dir=temp_dir)
+                uc_scoped = use_case_factory(temp_dir=temp_dir)
                 result = await uc_scoped.execute(json_data)
 
             job_store = load_job_store()

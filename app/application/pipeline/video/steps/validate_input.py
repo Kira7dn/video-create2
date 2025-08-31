@@ -40,7 +40,7 @@ class ValidateInputStep(BaseStep):
                 loc = ".".join(str(p) for p in err.get("loc", []))
                 msg = err.get("msg", "invalid input")
                 lines.append(f"{loc}: {msg}")
-            raise ValueError("\n".join(lines))
+            raise ValueError("\n".join(lines)) from e
 
         context.set("validated_data", payload.model_dump())
         context.ensure_run_id()

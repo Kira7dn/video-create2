@@ -12,11 +12,14 @@ logger = logging.getLogger(__name__)
 class DownloadAssetsStep(BaseStep):
     name = "download_assets"
     required_keys = ["validated_data"]
+
     def __init__(self, downloader: IAssetDownloader):
         self.downloader = downloader
         # Configure retry/timeout for network-bound operations
         self.retries = int(getattr(settings, "download_step_retries", 2))
-        self.retry_backoff = float(getattr(settings, "download_step_retry_backoff", 0.5))
+        self.retry_backoff = float(
+            getattr(settings, "download_step_retry_backoff", 0.5)
+        )
         self.max_backoff = float(getattr(settings, "download_step_max_backoff", 3.0))
         self.jitter = float(getattr(settings, "download_step_jitter", 0.2))
         self.use_exponential_backoff = bool(
@@ -58,7 +61,9 @@ class DownloadAssetsStep(BaseStep):
 
         async def _download_with_limit(url: str, kind: str, seg_id: str | None = None):
             async with semaphore:
-                return await self.downloader.download_asset(url, kind=kind, seg_id=seg_id)
+                return await self.downloader.download_asset(
+                    url, kind=kind, seg_id=seg_id
+                )
 
         for i, segment in enumerate(segments):
             seg = dict(segment)
@@ -68,14 +73,20 @@ class DownloadAssetsStep(BaseStep):
                 asset = seg.get(asset_type)
                 if isinstance(asset, dict) and asset.get("url"):
                     url = asset["url"]
-                    coroutines.append(_download_with_limit(url, kind=asset_type, seg_id=seg_id))
+                    coroutines.append(
+                        _download_with_limit(url, kind=asset_type, seg_id=seg_id)
+                    )
                     meta.append((i, asset_type))
             results.append(seg)
 
         # Queue background music download if available
         has_bg = isinstance(background_music, dict) and background_music.get("url")
         if has_bg:
-            coroutines.append(_download_with_limit(background_music["url"], kind="background_music", seg_id="bg"))
+            coroutines.append(
+                _download_with_limit(
+                    background_music["url"], kind="background_music", seg_id="bg"
+                )
+            )
             meta.append((-1, "background_music"))
         else:
             # Explicitly reflect absence of background music
@@ -90,7 +101,9 @@ class DownloadAssetsStep(BaseStep):
                 failed = isinstance(res, Exception) or not res
                 if seg_idx == -1:  # background music
                     if failed:
-                        logger.warning("Background music download failed; setting to None")
+                        logger.warning(
+                            "Background music download failed; setting to None"
+                        )
                         context.set("background_music", None)
                     else:
                         context.set("background_music", {**background_music, "local_path": res})  # type: ignore[arg-type]
@@ -103,7 +116,11 @@ class DownloadAssetsStep(BaseStep):
                     if 0 <= seg_idx < len(results):
                         if asset_type in results[seg_idx]:
                             del results[seg_idx][asset_type]
-                    logger.warning("Failed to download asset '%s' for segment index %s", asset_type, seg_idx)
+                    logger.warning(
+                        "Failed to download asset '%s' for segment index %s",
+                        asset_type,
+                        seg_idx,
+                    )
                     failures += 1
                 else:
                     asset = results[seg_idx].get(asset_type)
@@ -111,7 +128,9 @@ class DownloadAssetsStep(BaseStep):
                         results[seg_idx][asset_type] = {**asset, "local_path": res}
                     successes += 1
 
-            logger.info("Download summary: %d successes, %d failures", successes, failures)
+            logger.info(
+                "Download summary: %d successes, %d failures", successes, failures
+            )
 
         # Align with downstream expectation: write cleaned segments
         context.set("segments", results)

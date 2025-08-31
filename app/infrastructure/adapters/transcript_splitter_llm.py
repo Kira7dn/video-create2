@@ -63,8 +63,13 @@ class LLMTranscriptSplitter(ITranscriptSplitter):
             - Do NOT normalize punctuation, whitespace, or casing. Keep original punctuation and case. Only insert segment breaks.
             - Do NOT paraphrase, summarize, or reorder words.
             - Your output must be a list of segments that, when concatenated with a single space between segments, contains EXACTLY the same characters as the original input (ignoring only the inserted segment boundaries).
+            - Output MUST be JSON only, exactly matching this schema: {"segments": [string, ...]}. Do not include explanations, markdown, or any extra text.
             """,
-            model_settings={"temperature": 0.1},
+            model_settings={
+                "temperature": 0,
+                "presence_penalty": 0,
+                "frequency_penalty": 0,
+            },
         )
 
         prompt = f"""
@@ -97,53 +102,89 @@ class LLMTranscriptSplitter(ITranscriptSplitter):
 
             VALIDATION: After creating segments, verify that when joined together,
             they contain exactly the same words as the original transcript.
+            STRICT OUTPUT: Return ONLY a JSON object of the form {{"segments": ["..."]}} with no extra commentary.
+            If preservation is impossible, split only at existing whitespace; do not alter any characters.
             """
 
-        # Run LLM and collect segments (fallback on errors)
-        try:
-            result = await agent.run(user_prompt=prompt)
-            segs = result.output
-            segments_list = list(segs.segments)
-            logger.info(
-                "LLMTranscriptSplitter: using OPENAI for segmentation (content_id=%s)",
-                content_id,
-            )
-        except Exception as e:
-            logger.warning(
-                "LLMTranscriptSplitter: LLM exception -> %s (content_id=%s)",
-                repr(e),
-                content_id,
-            )
-            logger.info(
-                "LLMTranscriptSplitter: using FALLBACK due to LLM exception (content_id=%s)",
-                content_id,
-            )
-            segments_list = self._fallback_split(content)
+        # Run LLM and collect segments with retries before fallback
+        def _make_retry_prompt(
+            base: str, attempt_no: int, reason: str | None = None
+        ) -> str:
+            addition = (
+                "\n\nADDITIONAL INSTRUCTIONS (retry #{attempt}):\n"
+                "- Double-check content PRESERVATION: do not alter ANY characters.\n"
+                "- If unsure, prefer shorter segments but keep tokens identical.\n"
+                "- Ensure joined segments (with single spaces) match the original exactly (aside from boundaries).\n"
+            ).format(attempt=attempt_no)
+            if reason:
+                addition += f"- Previous attempt failed validation due to: {reason}\n"
+            return base + addition
+
+        async def _run_with_prompt(p: str) -> List[str]:
+            res = await agent.run(user_prompt=p)
+            out = res.output
+            return list(out.segments)
+
+        segments_list: List[str] | None = None
+        last_err: Exception | None = None
+        last_reason: str | None = None
+
+        # attempt 0 (base prompt) + up to 3 retries with additional prompt
+        for attempt in range(0, 4):
+            use_prompt = prompt if attempt == 0 else _make_retry_prompt(prompt, attempt)
+            try:
+                cand = await _run_with_prompt(use_prompt)
+                ok, reason = self._validate_content_preservation(content, cand)
+                if ok:
+                    segments_list = cand
+                    logger.info(
+                        "LLMTranscriptSplitter: using OPENAI for segmentation%s (content_id=%s)",
+                        " (retry #{} )".format(attempt) if attempt > 0 else "",
+                        content_id,
+                    )
+                    break
+                else:
+                    # Log reason for retry and strengthen prompt next iteration
+                    logger.info(
+                        "LLMTranscriptSplitter: validation failed%s (content_id=%s). Reason: %s",
+                        f" on retry #{attempt}" if attempt > 0 else "",
+                        content_id,
+                        reason,
+                    )
+                    last_reason = reason
+                    # Prepare next prompt to include the reason
+                    prompt = _make_retry_prompt(prompt, attempt + 1, reason)
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                logger.debug(
+                    "LLMTranscriptSplitter: LLM exception%s -> %s (content_id=%s)",
+                    f" on retry #{attempt}" if attempt > 0 else "",
+                    repr(e),
+                    content_id,
+                )
+                # continue to next retry
 
         duration = time.time() - start_time
 
-        # Validate preservation; if fails, fallback segments
-        if not self._validate_content_preservation(content, segments_list):
-            original_tokens = re.findall(r"\b\w+\b", content.lower())
-            segmented_tokens: List[str] = []
-            for segment in segments_list or []:
-                segmented_tokens.extend(re.findall(r"\b\w+\b", segment.lower()))
-
-            if not original_tokens:
-                reason = "Original tokens are empty"
-            else:
-                missing = set(original_tokens) - set(segmented_tokens)
-                extra = set(segmented_tokens) - set(original_tokens)
-                reason = f"Tokens mismatch. Missing: {missing} | Extra: {extra}"
+        # Fallback if all attempts failed or invalid
+        if not segments_list:
+            # One-time summary warning to avoid per-attempt noise
             logger.warning(
-                "LLMTranscriptSplitter: LLM output failed content preservation validation (content_id=%s). Reason: %s. Switching to fallback.",
+                "LLMTranscriptSplitter: falling back after retries (content_id=%s). last_reason=%s last_err=%s",
                 content_id,
-                reason,
+                last_reason,
+                repr(last_err) if last_err is not None else None,
             )
-            logger.info(
-                "LLMTranscriptSplitter: using FALLBACK due to validation failure (content_id=%s)",
-                content_id,
-            )
+            if last_err is not None:
+                logger.info(
+                    "LLMTranscriptSplitter: using FALLBACK due to LLM exceptions (content_id=%s)",
+                    content_id,
+                )
+            else:
+                logger.info(
+                    "LLMTranscriptSplitter: using FALLBACK due to repeated validation failures (content_id=%s)",
+                    content_id,
+                )
             segments_list = self._fallback_split(content)
 
         # Save segments to file in the same folder structure as TextOverBuilder
@@ -161,7 +202,7 @@ class LLMTranscriptSplitter(ITranscriptSplitter):
                 # Do not crash pipeline on IO errors
                 out_path = None
 
-        logger.debug(
+        logger.info(
             "Completed transcript segmentation in %.2f seconds, created %d segments%s",
             duration,
             len(segments_list),
@@ -170,27 +211,44 @@ class LLMTranscriptSplitter(ITranscriptSplitter):
         return segments_list
 
     @staticmethod
-    def _validate_content_preservation(original: str, segments: List[str]) -> bool:
-        """Ensure segmented tokens equal original tokens (case/punct-insensitive)."""
-        original_tokens = re.findall(r"\b\w+\b", original.lower())
+    def _validate_content_preservation(
+        original: str, segments: List[str]
+    ) -> tuple[bool, str | None]:
+        """Ensure segmented tokens equal original tokens (case/punct-insensitive).
+
+        Returns (ok, reason). Reason provided when ok is False.
+        """
+        # 1) Character-level preservation check with normalized whitespace
+        join_norm = " ".join(segments or [])
+        norm = lambda s: re.sub(r"\s+", " ", s).strip()
+        if norm(original) == norm(join_norm):
+            return (True, None)
+
+        # 2) Token-level preservation with apostrophes/hyphens kept inside tokens
+        token_pattern = r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*"
+        original_tokens = re.findall(token_pattern, original.lower())
         segmented_tokens: List[str] = []
         for segment in segments or []:
-            segmented_tokens.extend(re.findall(r"\b\w+\b", segment.lower()))
+            segmented_tokens.extend(re.findall(token_pattern, segment.lower()))
 
         if not original_tokens:
-            return len(segmented_tokens) == 0
+            return (
+                len(segmented_tokens) == 0,
+                (
+                    None
+                    if len(segmented_tokens) == 0
+                    else "Original tokens empty but segments not empty"
+                ),
+            )
         if not segments:
-            return False
+            return (False, "No segments produced")
         if original_tokens != segmented_tokens:
             missing = set(original_tokens) - set(segmented_tokens)
             extra = set(segmented_tokens) - set(original_tokens)
-            logger.warning(
-                "Content preservation failed: tokens mismatch. Missing: %s | Extra: %s",
-                missing,
-                extra,
-            )
-            return False
-        return True
+            reason = f"Tokens mismatch. Missing: {missing} | Extra: {extra}"
+            logger.debug("Content preservation failed: %s", reason)
+            return (False, reason)
+        return (True, None)
 
     @staticmethod
     def _fallback_split(content: str) -> List[str]:
