@@ -9,6 +9,44 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+def _approx_token_eq(a: str, b: str) -> bool:
+    """Approximate equality for tokens to handle simple inflections.
+
+    Rules kept minimal and deterministic:
+    - Exact match -> True
+    - Case-insensitive already handled by normalization in _tokens
+    - Strip possessive: trailing "'s" or "’s"
+    - Singularize basic English plurals:
+      * trailing 's' (length > 3)
+      * 'ies' -> 'y'
+      * 'es' for words ending with s, x, z, ch, sh
+    """
+
+    if a == b:
+        return True
+
+    def singularize(t: str) -> str:
+        # strip possessive
+        if t.endswith("'s") or t.endswith("’s"):
+            t = t[:-2]
+        # common plural -> singular
+        if len(t) > 3 and t.endswith("ies"):
+            return t[:-3] + "y"
+        if len(t) > 3 and t.endswith("s"):
+            # handle -es for s, x, z, ch, sh
+            if t.endswith("es") and (
+                t[:-2].endswith("s")
+                or t[:-2].endswith("x")
+                or t[:-2].endswith("z")
+                or t[:-2].endswith("ch")
+                or t[:-2].endswith("sh")
+            ):
+                return t[:-2]
+            return t[:-1]
+        return t
+
+    return singularize(a) == singularize(b)
+
 
 def _normalize_text(s: str) -> str:
     """Normalize text to match tokenization used in tests.
@@ -264,7 +302,7 @@ class TextOverBuilder3:
                         if idx >= n_tokens_words:
                             break
                         wt = word_token_stream[idx]
-                        if wt == start_tok:
+                        if _approx_token_eq(wt, start_tok):
                             found_start_tok_idx = idx
                             matched_offset = o
                             break
@@ -296,7 +334,7 @@ class TextOverBuilder3:
                     if cand < t0_idx or cand >= n_tokens_words:
                         continue
                     wt = word_token_stream[cand]
-                    if wt == last_tok:
+                    if _approx_token_eq(wt, last_tok):
                         t1_idx = cand
                         break
 
@@ -307,7 +345,7 @@ class TextOverBuilder3:
                     i = est_t1 + 1
                     steps = 0
                     while i < n_tokens_words and steps < max_scan and t1_idx is None:
-                        if i >= t0_idx and word_token_stream[i] == last_tok:
+                        if i >= t0_idx and _approx_token_eq(word_token_stream[i], last_tok):
                             t1_idx = i
                             break
                         i += 1
@@ -317,7 +355,7 @@ class TextOverBuilder3:
                         i = max(t0_idx, est_t1 - 1)
                         steps = 0
                         while i >= t0_idx and steps < max_scan:
-                            if word_token_stream[i] == last_tok:
+                            if _approx_token_eq(word_token_stream[i], last_tok):
                                 t1_idx = i
                                 break
                             i -= 1
