@@ -25,12 +25,19 @@ class ExpansionConfig:
     max_gap_s: float = 0.400  # Do not bridge gaps larger than this
     pad_s: float = 0.080  # Visual padding when no neighbor exists
     min_duration_s: float = 0.100  # Minimum overlay duration
-    lookahead_window: int = 30  # Flexible match lookahead window
+    lookahead_window: int = (
+        80  # Flexible match lookahead window (increased for robustness)
+    )
     max_skips_per_side: int = 4  # Greedy match tolerance
-    similarity_threshold: float = 0.9  # Match similarity threshold
+    similarity_threshold: float = 0.85  # Slightly relaxed to reduce overshoot misses
     max_internal_gap_s: float = (
         0.950  # Bridge sub-second internal gaps, but avoid crossing inter-line pauses (~>1s)
     )
+    # Backoff search config: when initial flexible match fails, widen the window and allow a small look-back
+    backoff_lookback: int = 15
+    backoff_window: int = 140
+    # Optional: enforce a minimum duration for multi-word lines (>=4 tokens). Default disabled.
+    min_multiword_duration_s: float = 0.0
 
 
 class TextOverBuilder(ITextOverBuilder):
@@ -121,10 +128,62 @@ class TextOverBuilder(ITextOverBuilder):
         except Exception as e:
             logger.debug(f"normalize_total_duration skipped due to error: {e}")
 
+        # Post-pass: enforce ordering, non-overlap, and correct word_count
+        try:
+            self._postprocess_items(text_over_items)
+        except Exception as e:
+            logger.debug(f"postprocess_items skipped due to error: {e}")
+
+        # Final safety clamp: enforce global window [first_success_start - cap, last_success_end + cap]
+        try:
+            self._final_global_clamp(text_over_items, success_words)
+        except Exception as e:
+            logger.debug(f"final_global_clamp skipped due to error: {e}")
+
         if text_over_id:
             self._persist_output(text_over_items, text_over_id)
 
         return text_over_items
+
+    def _final_global_clamp(
+        self, items: List[Dict[str, Any]], success_words: List[Dict[str, Any]]
+    ) -> None:
+        if not items or not success_words:
+            return
+        first = None
+        last = None
+        for w in success_words:
+            try:
+                if isinstance(w, dict) and "start" in w and "end" in w:
+                    s = float(w["start"])
+                    e = float(w["end"])
+                    if math.isfinite(s) and math.isfinite(e) and e > s:
+                        first = s if first is None else min(first, s)
+                        last = e if last is None else max(last, e)
+            except Exception:
+                continue
+        if first is None or last is None:
+            return
+        cap = self._cap_each_side()
+        min_start = max(0.0, first - cap)
+        # Epsilon-safe right bound to prevent tiny FP overshoot
+        eps = 1e-6
+        max_end = (last + cap) - eps
+        for it in items:
+            try:
+                start = float(it.get("start_time", 0.0))
+                dur = float(it.get("duration", 0.0))
+                end = start + dur
+            except (ValueError, TypeError):
+                continue
+            if start < min_start:
+                start = min_start
+            if end > max_end:
+                end = max_end
+            if end <= start:
+                end = start + self._config.min_duration_s
+            it["start_time"] = start
+            it["duration"] = max(0.0, end - start)
 
     def _process_chunk(
         self,
@@ -172,6 +231,25 @@ class TextOverBuilder(ITextOverBuilder):
         word_index: int,
     ) -> List[Dict[str, Any]]:
         """Find word alignment using greedy then flexible matching."""
+
+        # Small helpers to avoid duplication
+        def _clamp(a: int, lo: int, hi: int) -> int:
+            return max(lo, min(a, hi))
+
+        def _run_flexible_window(start_idx: int, end_idx: int) -> List[Dict[str, Any]]:
+            """Run flexible match on a clamped [start_idx:end_idx) window."""
+            s = _clamp(int(start_idx), 0, len(success_words))
+            e = _clamp(int(end_idx), s, len(success_words))
+            if e <= s:
+                return []
+            window_items = success_words[s:e]
+            return (
+                find_flexible_match(
+                    normalized_text, window_items, max_lookahead=len(window_items)
+                )
+                or []
+            )
+
         # Try greedy shift match first
         group = find_greedy_shift_match(
             normalized_text,
@@ -184,15 +262,31 @@ class TextOverBuilder(ITextOverBuilder):
         if group:
             return group
 
-        # Fallback to flexible partial match
-        window_items = success_words[
-            word_index : word_index + self._config.lookahead_window
-        ]
-        flex_group = find_flexible_match(
-            normalized_text, window_items, max_lookahead=self._config.lookahead_window
+        # Fallback to flexible partial match on primary window
+        flex_group = _run_flexible_window(
+            word_index, word_index + self._config.lookahead_window
         )
 
-        return flex_group or []
+        if flex_group:
+            return flex_group
+
+        # Backoff: expand window and allow slight look-back in case cursor overshot the true region
+        try:
+            start = int(word_index) - int(self._config.backoff_lookback)
+            end = int(word_index) + int(self._config.backoff_window)
+            backoff_group = _run_flexible_window(start, end)
+            if backoff_group:
+                logger.info(
+                    "[text_over_builder:backoff] used backoff search start=%s end=%s size=%s",
+                    max(0, start),
+                    min(len(success_words), end),
+                    min(len(success_words), max(0, end)) - max(0, start),
+                )
+                return backoff_group
+        except Exception as e:
+            logger.debug(f"backoff search failed: {e}")
+
+        return []
 
     def _extend_group_internal(
         self,
@@ -233,28 +327,22 @@ class TextOverBuilder(ITextOverBuilder):
                 nonlocal left_idx, right_idx, current_start, current_end
                 if direction > 0:
                     idx = right_idx + 1
-                    bound_check = lambda k: k < len(success_words)
-                else:
-                    idx = left_idx - 1
-                    bound_check = lambda k: k >= 0
+                    while idx < len(success_words):
+                        w = success_words[idx]
+                        # Skip untimed entries (e.g., not-found-in-audio) instead of stopping
+                        if not (isinstance(w, dict) and "start" in w and "end" in w):
+                            idx += direction
+                            continue
+                        try:
+                            w_start = float(w["start"])
+                            w_end = float(w["end"])
+                        except (ValueError, TypeError):
+                            idx += direction
+                            continue
+                        if not (math.isfinite(w_start) and math.isfinite(w_end)):
+                            idx += direction
+                            continue
 
-                while bound_check(idx):
-                    w = success_words[idx]
-                    # Skip untimed entries (e.g., not-found-in-audio) instead of stopping
-                    if not (isinstance(w, dict) and "start" in w and "end" in w):
-                        idx += direction
-                        continue
-                    try:
-                        w_start = float(w["start"])
-                        w_end = float(w["end"])
-                    except (ValueError, TypeError):
-                        idx += direction
-                        continue
-                    if not (math.isfinite(w_start) and math.isfinite(w_end)):
-                        idx += direction
-                        continue
-
-                    if direction > 0:
                         gap = w_start - float(current_end)
                         w_tokens_set = (
                             self._success_token_sets[idx]
@@ -269,7 +357,24 @@ class TextOverBuilder(ITextOverBuilder):
                             idx += direction
                             continue
                         break
-                    else:
+                else:
+                    idx = left_idx - 1
+                    while idx >= 0:
+                        w = success_words[idx]
+                        # Skip untimed entries (e.g., not-found-in-audio) instead of stopping
+                        if not (isinstance(w, dict) and "start" in w and "end" in w):
+                            idx += direction
+                            continue
+                        try:
+                            w_start = float(w["start"])
+                            w_end = float(w["end"])
+                        except (ValueError, TypeError):
+                            idx += direction
+                            continue
+                        if not (math.isfinite(w_start) and math.isfinite(w_end)):
+                            idx += direction
+                            continue
+
                         gap = float(current_start) - w_end
                         w_tokens_set = (
                             self._success_token_sets[idx]
@@ -469,6 +574,9 @@ class TextOverBuilder(ITextOverBuilder):
         self, gap: Optional[float], is_left: bool, allow_no_neighbor: bool
     ) -> float:
         """Calculate extension for one side based on gap and configuration."""
+        # Marking as used to satisfy linters; current logic is symmetric and does not need these flags.
+        _ = is_left
+        _ = allow_no_neighbor
         if gap is None:
             # No neighbor timing available (corrupted/missing) → treat as absent neighbor and apply no-neighbor padding
             return max(0.0, self._config.max_expand_s + self._config.pad_s)
@@ -537,8 +645,10 @@ class TextOverBuilder(ITextOverBuilder):
         if not items:
             return
 
-        # Compute success duration total
+        # Compute success duration total and global bounds
         success_total = 0.0
+        global_first_start = None
+        global_last_end = None
         for w in success_words:
             try:
                 if isinstance(w, dict) and "start" in w and "end" in w:
@@ -546,6 +656,14 @@ class TextOverBuilder(ITextOverBuilder):
                     e = float(w["end"])
                     if math.isfinite(s) and math.isfinite(e) and e > s:
                         success_total += e - s
+                        global_first_start = (
+                            s
+                            if global_first_start is None
+                            else min(global_first_start, s)
+                        )
+                        global_last_end = (
+                            e if global_last_end is None else max(global_last_end, e)
+                        )
             except Exception:
                 continue
 
@@ -553,8 +671,6 @@ class TextOverBuilder(ITextOverBuilder):
         budget = success_total + 2 * cap_each_side
 
         def snap_to_base(it: Dict[str, Any]) -> None:
-            base_len = float(it.get("_words_dur_sum", 0.0))
-            ext = max(0.0, float(it.get("duration", 0.0)) - base_len)
             start = float(it.get("start_time", 0.0))
             end = start + float(it.get("duration", 0.0))
             base_start = float(it.get("_base_start", start))
@@ -569,28 +685,68 @@ class TextOverBuilder(ITextOverBuilder):
         def cap_extreme_left(it: Dict[str, Any], cap: float) -> None:
             start = float(it.get("start_time", 0.0))
             end = start + float(it.get("duration", 0.0))
-            base_start = float(it.get("_base_start", start))
-            desired_start = min(
-                base_start, start + cap
-            )  # cannot extend left more than cap beyond base_start
-            new_start = max(desired_start, 0.0)
+            # Enforce start_time >= global_first_start - cap
+            base_start_global = (
+                float(global_first_start) if global_first_start is not None else start
+            )
+            min_allowed_start = max(0.0, base_start_global - cap)
+            new_start = max(start, min_allowed_start)
             if new_start > start:
-                # moving right reduces duration
                 it["start_time"] = new_start
                 it["duration"] = max(0.0, end - new_start)
 
         def cap_extreme_right(it: Dict[str, Any], cap: float) -> None:
             start = float(it.get("start_time", 0.0))
             end = start + float(it.get("duration", 0.0))
-            base_end = float(it.get("_base_end", end))
-            desired_end = max(
-                base_end, end - cap
-            )  # cannot extend right more than cap beyond base_end
-            new_end = max(desired_end, start)
+            # Enforce end_time <= global_last_end + cap
+            base_end_global = (
+                float(global_last_end) if global_last_end is not None else end
+            )
+            # Epsilon-safe right bound to avoid minor FP overshoot
+            eps = 1e-6
+            max_allowed_end = (base_end_global + cap) - eps
+            new_end = min(end, max_allowed_end)
             if new_end < end:
                 it["duration"] = max(0.0, new_end - start)
 
-        # 1) If over budget, remove all extensions on interior items
+        # Always cap each item to global timeline window first, then also cap extremes
+        if items:
+            # Per-item clamp to [global_first_start - cap, global_last_end + cap]
+            min_window_start = (
+                max(0.0, float(global_first_start) - cap_each_side)
+                if global_first_start is not None
+                else 0.0
+            )
+            # Epsilon-safe right bound
+            eps = 1e-6
+            max_window_end = (
+                (float(global_last_end) + cap_each_side - eps)
+                if global_last_end is not None
+                else None
+            )
+            for it in items:
+                try:
+                    start = float(it.get("start_time", 0.0))
+                    dur = float(it.get("duration", 0.0))
+                    end = start + dur
+                except (ValueError, TypeError):
+                    continue
+                # Left clamp
+                if start < min_window_start:
+                    start = min_window_start
+                # Right clamp
+                if max_window_end is not None and end > max_window_end:
+                    end = max_window_end
+                if end <= start:
+                    end = start + self._config.min_duration_s
+                it["start_time"] = start
+                it["duration"] = max(0.0, end - start)
+
+            # Additionally, cap extremes for idempotency (no-ops if already within window)
+            cap_extreme_left(items[0], cap_each_side)
+            cap_extreme_right(items[-1], cap_each_side)
+
+        # 1) If over budget after extreme capping, remove all extensions on interior items
         current_total = sum(float(it.get("duration", 0.0)) for it in items)
         excess = current_total - budget
         if excess <= 1e-6:
@@ -600,7 +756,7 @@ class TextOverBuilder(ITextOverBuilder):
             for it in items[1:-1]:
                 snap_to_base(it)
 
-        # 2) Cap extreme-side extensions to allowance
+        # 2) Re-apply extreme capping after snapping interiors (idempotent safeguard)
         if items:
             cap_extreme_left(items[0], cap_each_side)
             cap_extreme_right(items[-1], cap_each_side)
@@ -625,8 +781,6 @@ class TextOverBuilder(ITextOverBuilder):
                 it = items[0]
                 start = float(it.get("start_time", 0.0))
                 dur = float(it.get("duration", 0.0))
-                base_start = float(it.get("_base_start", start))
-                min_start = max(base_start, start)  # don't cross base
                 max_move = dur - self._config.min_duration_s
                 move = min(take, max(0.0, max_move))
                 it["start_time"] = start + move
@@ -637,12 +791,74 @@ class TextOverBuilder(ITextOverBuilder):
                 it = items[-1]
                 start = float(it.get("start_time", 0.0))
                 dur = float(it.get("duration", 0.0))
-                base_end = float(it.get("_base_end", start + dur))
                 max_move = dur - self._config.min_duration_s
                 move = min(take, max(0.0, max_move))
                 it["duration"] = max(self._config.min_duration_s, dur - move)
 
             remaining_excess = total_duration() - budget
+
+    def _postprocess_items(self, items: List[Dict[str, Any]]) -> None:
+        """Preserve order, remove overlaps, and normalize word_count.
+
+        - Preserve the existing list order (transcript order)
+        - Enforce non-overlap by clamping each start_time >= previous end
+        - Ensure minimum duration for readability
+        - Recompute word_count as number of normalized tokens from the text
+        """
+        if not items:
+            return
+
+        # Enforce non-overlap and min duration
+        prev_end = None
+        for it in items:
+            try:
+                start = float(it.get("start_time", 0.0))
+                dur = float(it.get("duration", 0.0))
+            except (ValueError, TypeError):
+                start = (
+                    float(it.get("start_time", 0.0))
+                    if isinstance(it.get("start_time"), (int, float))
+                    else 0.0
+                )
+                dur = (
+                    float(it.get("duration", 0.0))
+                    if isinstance(it.get("duration"), (int, float))
+                    else 0.0
+                )
+
+            if prev_end is not None and start < prev_end:
+                # Shift start to prev_end to remove overlap
+                start = prev_end
+
+            # Ensure minimum duration
+            dur = max(dur, self._config.min_duration_s)
+
+            it["start_time"] = max(0.0, start)
+            it["duration"] = max(self._config.min_duration_s, dur)
+
+            prev_end = it["start_time"] + it["duration"]
+
+        # Recompute word_count from normalized text tokens for consistency
+        for it in items:
+            try:
+                text = str(it.get("text", ""))
+                it["word_count"] = len(normalize_text(text))
+            except Exception:
+                # Leave existing word_count if normalization fails
+                pass
+
+        # Enforce reasonable duration for multi-word lines (>=4 tokens) if configured
+        min_req = float(getattr(self._config, "min_multiword_duration_s", 0.0) or 0.0)
+        if min_req > 0:
+            for it in items:
+                try:
+                    tokens = int(it.get("word_count", 0))
+                    if tokens >= 4:
+                        dur = float(it.get("duration", 0.0))
+                        if dur < min_req:
+                            it["duration"] = min_req
+                except Exception:
+                    continue
 
     def _cap_each_side(self) -> float:
         """Helper: maximum allowed combined extension on a single extreme side."""

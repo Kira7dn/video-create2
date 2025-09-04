@@ -341,6 +341,12 @@ def normalize_text(text: str) -> List[str]:
     Returns:
         List[str]: Danh sách các từ đã được chuẩn hóa
     """
-    # Tách từ và loại bỏ dấu câu
-    words = re.findall(r"\b\w+\b", text.lower())
+    # Thay thế các ký tự nối (hyphen/dash) bằng khoảng trắng để tách từ ghép thành 2 token
+    # Bao gồm: hyphen '-', non-breaking hyphen '‑', figure dash '‒', en dash '–', em dash '—'
+    lowered = text.lower()
+    lowered = re.sub(r"[\-\u2010\u2011\u2012\u2013\u2014]", " ", lowered)
+    # Chuẩn hóa nhiều khoảng trắng liên tiếp về một khoảng trắng
+    lowered = re.sub(r"\s+", " ", lowered)
+    # Tách từ và loại bỏ dấu câu còn lại
+    words = re.findall(r"\b\w+\b", lowered)
     return words

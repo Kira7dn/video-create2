@@ -7,7 +7,8 @@ from .gentle_transcription_aligner import GentleTranscriptionAligner
 from .media_probe_ffmpeg import FFmpegMediaProbe
 from .image_processor import ImageProcessor
 from .transcript_splitter_llm import LLMTranscriptSplitter
-from .text_over_builder import TextOverBuilder
+from .text_over_builder2 import TextOverBuilder2
+from .text_over_builder3 import TextOverBuilder3
 
 __all__ = [
     "AssetRepoDownloader",
@@ -19,5 +20,6 @@ __all__ = [
     "FFmpegMediaProbe",
     "ImageProcessor",
     "LLMTranscriptSplitter",
-    "TextOverBuilder",
+    "TextOverBuilder2",
+    "TextOverBuilder3",
 ]

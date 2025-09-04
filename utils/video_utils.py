@@ -12,6 +12,8 @@ import math
 import shutil
 from typing import List, Optional, Dict, Any
 
+from app.core.config import settings
+
 from utils.subprocess_utils import safe_subprocess_run, SubprocessError
 
 
@@ -130,14 +132,18 @@ def ffmpeg_concat_videos(
         bgm_path = background_music.get("local_path")
         start_delay = float(background_music.get("start_delay", 0) or 0)
         video_duration = get_duration(temp_path)
+        auto_volume = bool(getattr(settings, "audio_auto_volume_enabled", True))
         if logger:
-            logger.info("🔈 Auto-volume: loudnorm (default)")
+            if auto_volume:
+                logger.info("🔈 Auto-volume: loudnorm + ducking (enabled)")
+            else:
+                logger.info("🔇 Auto-volume disabled: no loudnorm, no ducking; mixing BGM at fixed volume")
 
         # Always pre-normalize BGM using EBU R128 loudness (two-pass when possible)
-        # Hardcoded targets as requested
-        target_i = -16.0  # LUFS
-        target_tp = -1.5  # dBTP
-        target_lra = 11.0  # LU
+        # Targets now aligned with renderer segment settings
+        target_i = float(getattr(settings, "segment_audio_target_i", -16.0))  # LUFS
+        target_tp = float(getattr(settings, "segment_audio_target_tp", -1.5))  # dBTP
+        target_lra = float(getattr(settings, "segment_audio_target_lra", 11.0))  # LU
 
         def _analyze_loudness(path: str) -> Optional[dict]:
             cmd = [
@@ -174,50 +180,51 @@ def ffmpeg_concat_videos(
                     logger.warning(f"Loudnorm analyze failed: {e}")
                 return None
 
-        analysis = _analyze_loudness(bgm_path)
-        try:
-            normalized_bgm_path = os.path.join(temp_dir, "bgm_loudnorm.wav")
-            if analysis:
-                # Two-pass with measured values
-                ln_filter = (
-                    "loudnorm="
-                    f"I={target_i}:TP={target_tp}:LRA={target_lra}:"
-                    f"measured_I={analysis['input_i']}:"
-                    f"measured_LRA={analysis['input_lra']}:"
-                    f"measured_TP={analysis['input_tp']}:"
-                    f"measured_thresh={analysis['input_thresh']}:"
-                    f"offset={analysis['target_offset']}:"
-                    "linear=true:print_format=summary"
-                )
-            else:
-                # Fallback to single-pass loudnorm
-                ln_filter = (
-                    "loudnorm="
-                    f"I={target_i}:TP={target_tp}:LRA={target_lra}:"
-                    "linear=true:print_format=summary"
-                )
-            cmd_norm = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                bgm_path,
-                "-af",
-                ln_filter,
-                "-vn",
-                "-acodec",
-                "pcm_s16le",
-                normalized_bgm_path,
-            ]
-            safe_subprocess_run(cmd_norm, "Normalize BGM loudness", logger)
-            if logger:
-                logger.info(
-                    f"🎚️ BGM loudness normalized to I={target_i} LUFS, TP={target_tp} dB"
-                )
-            bgm_path = normalized_bgm_path
-        except Exception as e:
-            if logger:
-                logger.warning(f"Loudnorm normalization failed, continue without: {e}")
-            normalized_bgm_path = None
+        if auto_volume:
+            analysis = _analyze_loudness(bgm_path)
+            try:
+                normalized_bgm_path = os.path.join(temp_dir, "bgm_loudnorm.wav")
+                if analysis:
+                    # Two-pass with measured values
+                    ln_filter = (
+                        "loudnorm="
+                        f"I={target_i}:TP={target_tp}:LRA={target_lra}:"
+                        f"measured_I={analysis['input_i']}:"
+                        f"measured_LRA={analysis['input_lra']}:"
+                        f"measured_TP={analysis['input_tp']}:"
+                        f"measured_thresh={analysis['input_thresh']}:"
+                        f"offset={analysis['target_offset']}:"
+                        "linear=true:print_format=summary"
+                    )
+                else:
+                    # Fallback to single-pass loudnorm
+                    ln_filter = (
+                        "loudnorm="
+                        f"I={target_i}:TP={target_tp}:LRA={target_lra}:"
+                        "linear=true:print_format=summary"
+                    )
+                cmd_norm = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    bgm_path,
+                    "-af",
+                    ln_filter,
+                    "-vn",
+                    "-acodec",
+                    "pcm_s16le",
+                    normalized_bgm_path,
+                ]
+                safe_subprocess_run(cmd_norm, "Normalize BGM loudness", logger)
+                if logger:
+                    logger.info(
+                        f"🎚️ BGM loudness normalized to I={target_i} LUFS, TP={target_tp} dB"
+                    )
+                bgm_path = normalized_bgm_path
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Loudnorm normalization failed, continue without: {e}")
+                normalized_bgm_path = None
 
         # Mix level for BGM after normalization (no auto detection needed)
         try:
@@ -274,7 +281,7 @@ def ffmpeg_concat_videos(
         # Use 'duration=first' to tie mixed audio to the video audio (0:a)
         # Add optional ducking via sidechaincompress (default: enabled)
         # Final limiter to avoid clipping
-        enable_ducking = bool(background_music.get("ducking", True))
+        enable_ducking = bool(background_music.get("ducking", True)) and auto_volume
         if enable_ducking and logger:
             logger.info("🪝 Ducking enabled (sidechaincompress)")
 

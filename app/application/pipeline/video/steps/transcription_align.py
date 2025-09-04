@@ -118,18 +118,6 @@ class TranscriptionAlignStep(BaseStep):
                 # Any other unexpected builder error, attempt fallback
                 pass
 
-            # Safety: if builder produced no items but we have content, synthesize fallback
-            if not text_over_items and content:
-                fallback_chunks = chunks if chunks else [content]
-                try:
-                    text_over_items = self.builder.build(
-                        word_items=[],
-                        chunks=fallback_chunks,
-                        text_over_id=seg_id,
-                    )
-                except Exception:
-                    text_over_items = []
-
             seg_out["text_over"] = text_over_items
             try:
                 self.logger.info(

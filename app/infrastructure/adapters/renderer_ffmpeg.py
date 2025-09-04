@@ -3,11 +3,15 @@ from typing import Sequence, Any
 import asyncio
 import os
 from pathlib import Path
+import logging
 
 from app.core.config import settings
 from app.application.interfaces.renderer import IVideoRenderer
 from utils.video_utils import ffmpeg_concat_videos
 from utils.subprocess_utils import safe_subprocess_run
+
+
+logger = logging.getLogger(__name__)
 
 
 class FFMpegVideoRenderer(IVideoRenderer):
@@ -261,6 +265,7 @@ class FFMpegVideoRenderer(IVideoRenderer):
         # Translate ops -> ffmpeg filters
         video_filters: list[str] = []
         audio_filters: list[str] = []
+        used_loudnorm: bool = False
 
         def add_fade(target: str, spec: dict):
             if not isinstance(spec, dict):
@@ -296,6 +301,24 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 continue
             kind = op.get("op")
             if kind == "audio_delay":
+                continue
+            if kind == "audio_normalize":
+                # Normalize segment audio loudness to common target and apply a safety limiter
+                # Use EBU R128 targets similar to concat stage, but single-pass for speed.
+                # This ensures each segment has consistent perceived loudness before concat.
+                if getattr(settings, "segment_audio_normalize_enabled", True):
+                    target_i = float(getattr(settings, "segment_audio_target_i", -16.0))
+                    target_tp = float(getattr(settings, "segment_audio_target_tp", -1.5))
+                    target_lra = float(getattr(settings, "segment_audio_target_lra", 11.0))
+                    loudnorm = (
+                        f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:"
+                        "print_format=summary"
+                    )
+                    audio_filters.append(loudnorm)
+                    used_loudnorm = True
+                    # Add a soft limiter to avoid inter-sample peaks after normalization
+                    if getattr(settings, "segment_audio_limiter_enabled", True):
+                        audio_filters.append("alimiter=limit=0.95")
                 continue
             if kind == "pixel_format":
                 fmt = op.get("format") or "yuv420p"
@@ -475,7 +498,18 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 output_path,
             ]
 
-        await asyncio.to_thread(safe_subprocess_run, cmd, "Render with plan")
+        result = await asyncio.to_thread(safe_subprocess_run, cmd, "Render with plan")
+        # Optionally log loudnorm summary for easier analysis in tests/integration
+        if used_loudnorm and getattr(settings, "segment_audio_log_loudnorm", False):
+            try:
+                stderr = (getattr(result, "stderr", None) or "").strip()
+                if stderr:
+                    # Keep log size reasonable; ffmpeg prints lots of lines
+                    preview = stderr if len(stderr) < 8000 else stderr[:8000] + "... [truncated]"
+                    logger.info("[loudnorm-summary]\n%s", preview)
+            except Exception:
+                # Do not fail rendering due to logging issues
+                pass
         return output_path
 
     # Compatibility helpers for legacy media-processing method names
@@ -665,8 +699,8 @@ class FFMpegVideoRenderer(IVideoRenderer):
                     }
                 )
             elif transform_type == "audio_normalize":
-                # Map to audio padding
-                ops.append({"op": "audio_pad"})
+                # Request per-segment audio loudness normalization
+                ops.append({"op": "audio_normalize"})
             elif transform_type == "audio_delay":
                 # Pass through to renderer as an op with milliseconds
                 ms = int(transform.get("milliseconds", 0) or 0)

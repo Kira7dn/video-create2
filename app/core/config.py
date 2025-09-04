@@ -105,6 +105,17 @@ class Settings(BaseSettings):
     audio_background_music_volume: float = 0.1
     audio_default_sample_rate: int = 44100
     audio_default_bitrate: str = "192k"
+    # Enable loudness normalization and ducking for BGM during concat
+    audio_auto_volume_enabled: bool = False
+
+    # Per-Segment Audio Loudness Normalization (Renderer)
+    segment_audio_normalize_enabled: bool = True
+    segment_audio_target_i: float = -16.0
+    segment_audio_target_tp: float = -1.5
+    segment_audio_target_lra: float = 11.0
+    segment_audio_limiter_enabled: bool = True
+    # When true, renderer will log ffmpeg loudnorm summary output on success
+    segment_audio_log_loudnorm: bool = False
 
     # Text Overlay Settings
     text_default_font_size: int = 48
