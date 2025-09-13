@@ -128,6 +128,7 @@ def ffmpeg_concat_videos(
         logger.info(f"Final video concat: {temp_path}")
 
     # 2. Overlay background music if provided
+    bgm_processed = False
     if background_music and background_music.get("local_path"):
         bgm_path = background_music.get("local_path")
         start_delay = float(background_music.get("start_delay", 0) or 0)
@@ -341,10 +342,39 @@ def ffmpeg_concat_videos(
         if logger:
             logger.info(f"Mixing BGM (atomic operation): {' '.join(ffmpeg_mix_cmd)}")
         safe_subprocess_run(ffmpeg_mix_cmd, "Background music mixing", logger)
-        # Final output is temp_final_with_bgm
+        # Final output for this branch is temp_final_with_bgm
         temp_path = temp_final_with_bgm
+        bgm_processed = True
 
-    # 3. Copy final result to output_path (do not overwrite if exists)
+    # 3. Write final result to output_path (do not overwrite if exists)
     if os.path.exists(output_path):
         raise VideoProcessingError(f"Output file already exists: {output_path}")
-    shutil.copy2(temp_path, output_path)
+    if bgm_processed:
+        # BGM branch already re-encoded; just copy the result
+        shutil.copy2(temp_path, output_path)
+    else:
+        # No BGM: perform a lightweight re-encode to normalize timestamps and remove encoder delays
+        # This avoids A/V drift introduced by concat demuxer + stream copy
+        reenc_cmd = [
+            "ffmpeg",
+            "-y",
+            "-threads",
+            "1",
+            "-i",
+            temp_path,
+            "-vsync",
+            "2",
+            "-af",
+            "aresample=async=1:first_pts=0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            output_path,
+        ]
+        if logger:
+            logger.info(f"Re-encode to normalize A/V after concat: {' '.join(reenc_cmd)}")
+        safe_subprocess_run(reenc_cmd, "Normalize A/V after concat", logger)

@@ -4,6 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 import logging
+import re
 
 from app.core.config import settings
 from app.application.interfaces.renderer import IVideoRenderer
@@ -266,6 +267,146 @@ class FFMpegVideoRenderer(IVideoRenderer):
         video_filters: list[str] = []
         audio_filters: list[str] = []
         used_loudnorm: bool = False
+        ass_events: list[dict] = []
+
+        def _normalize_text(text: str) -> str:
+            """Normalize quotes/whitespace artifacts in overlay text."""
+            try:
+                return (
+                    text.replace("\\n", "\n")
+                    .replace("’", "'")
+                    .replace("‘", "'")
+                    .replace("“", '"')
+                    .replace("”", '"')
+                    .replace("\u00a0", " ")
+                    .replace("\u200b", " ")
+                )
+            except Exception:
+                return text
+
+        def _parse_color(
+            col: str, default_rgb=(255, 255, 255)
+        ) -> tuple[int, int, int, float]:
+            """Return (R,G,B,opacity) from a color string like 'black@0.4' or '#RRGGBB' or 'white'.
+            opacity in [0..1], where 1=opaque. If not specified, assume 1.0.
+            """
+            if not isinstance(col, str) or not col:
+                r, g, b = default_rgb
+                return r, g, b, 1.0
+            name_alpha = col.split("@", 1)
+            name = name_alpha[0].strip().lower()
+            try:
+                opacity = float(name_alpha[1]) if len(name_alpha) > 1 else 1.0
+                if opacity < 0:
+                    opacity = 0.0
+                if opacity > 1:
+                    opacity = 1.0
+            except Exception:
+                opacity = 1.0
+            named = {
+                "black": (0, 0, 0),
+                "white": (255, 255, 255),
+                "red": (255, 0, 0),
+                "green": (0, 255, 0),
+                "blue": (0, 0, 255),
+                "yellow": (255, 255, 0),
+                "cyan": (0, 255, 255),
+                "magenta": (255, 0, 255),
+            }
+            if name.startswith("#") and len(name) == 7:
+                try:
+                    r = int(name[1:3], 16)
+                    g = int(name[3:5], 16)
+                    b = int(name[5:7], 16)
+                    return r, g, b, opacity
+                except Exception:
+                    pass
+            if name in named:
+                r, g, b = named[name]
+            else:
+                r, g, b = default_rgb
+            return r, g, b, opacity
+
+        def _parse_pos(
+            x_val: Any, y_val: Any, vw: int, vh: int
+        ) -> tuple[int, int, int]:
+            """Map common drawtext-like x/y to ASS coordinates and alignment.
+            Returns (px, py, an) where an is ASS alignment (1..9).
+            Heuristics:
+            - Center X: if contains 'w-text_w' or equals '(w-text_w)/2' -> px = vw//2
+            - Bottom Y offset: pattern like 'h-text_h-<k>*h' -> py = vh - int(k*vh)
+            - Middle Y: '(h-text_h)/2' -> py = vh//2
+            - If numeric, use directly; else defaults to bottom area.
+            Default alignment = 2 (bottom-center).
+            """
+            an = 2  # bottom-center by default
+            # X parsing
+            px: int
+            if isinstance(x_val, (int, float)):
+                px = int(x_val)
+            elif isinstance(x_val, str):
+                xs = x_val.replace(" ", "")
+                if "w-text_w" in xs or xs == "(w-text_w)/2":
+                    px = vw // 2
+                    # keep center alignment horizontally
+                else:
+                    # Fallback: try numeric literal
+                    try:
+                        px = int(float(xs))
+                    except Exception:
+                        px = vw // 2
+            else:
+                px = vw // 2
+
+            # Y parsing
+            py: int
+            if isinstance(y_val, (int, float)):
+                py = int(y_val)
+                # decide vertical alignment based on y
+                if py <= vh // 3:
+                    an = 8  # top-center
+                elif py >= (2 * vh) // 3:
+                    an = 2  # bottom-center
+                else:
+                    an = 5  # middle-center
+            elif isinstance(y_val, str):
+                ys = y_val.replace(" ", "")
+                # h-text_h-<k>*h
+                m = re.match(r"h-?text_h-([0-9]*\.?[0-9]+)\*h", ys)
+                if m:
+                    k = float(m.group(1))
+                    py = int(vh - k * vh)
+                    an = 2
+                elif ys == "(h-text_h)/2":
+                    py = vh // 2
+                    an = 5
+                else:
+                    # try numeric
+                    try:
+                        py = int(float(ys))
+                        if py <= vh // 3:
+                            an = 8
+                        elif py >= (2 * vh) // 3:
+                            an = 2
+                        else:
+                            an = 5
+                    except Exception:
+                        # default near bottom
+                        py = int(vh * 0.92)
+                        an = 2
+            else:
+                py = int(vh * 0.92)
+                an = 2
+
+            return px, py, an
+
+        def _fmt_time(val: float, *, ndigits: int = 3) -> str:
+            try:
+                d = round(float(val), ndigits)
+            except Exception:
+                d = float(val)
+            s = f"{d:.{ndigits}f}".rstrip("0").rstrip(".")
+            return s if s else "0"
 
         def add_fade(target: str, spec: dict):
             if not isinstance(spec, dict):
@@ -273,17 +414,21 @@ class FFMpegVideoRenderer(IVideoRenderer):
             if "in" in spec and isinstance(spec["in"], dict):
                 st = float(spec["in"].get("start", 0))
                 d = float(spec["in"].get("duration", 0))
+                st_s = _fmt_time(st)
+                d_s = _fmt_time(d)
                 if target == "video":
-                    video_filters.append(f"fade=t=in:st={st}:d={d}")
+                    video_filters.append(f"fade=t=in:st={st_s}:d={d_s}")
                 else:
-                    audio_filters.append(f"afade=t=in:st={st}:d={d}")
+                    audio_filters.append(f"afade=t=in:st={st_s}:d={d_s}")
             if "out" in spec and isinstance(spec["out"], dict):
                 st = float(spec["out"].get("start", 0))
                 d = float(spec["out"].get("duration", 0))
+                st_s = _fmt_time(st)
+                d_s = _fmt_time(d)
                 if target == "video":
-                    video_filters.append(f"fade=t=out:st={st}:d={d}")
+                    video_filters.append(f"fade=t=out:st={st_s}:d={d_s}")
                 else:
-                    audio_filters.append(f"afade=t=out:st={st}:d={d}")
+                    audio_filters.append(f"afade=t=out:st={st_s}:d={d_s}")
 
         # Pass 1: apply audio_delay first (before any afade)
         for op in ops:
@@ -308,8 +453,12 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 # This ensures each segment has consistent perceived loudness before concat.
                 if getattr(settings, "segment_audio_normalize_enabled", True):
                     target_i = float(getattr(settings, "segment_audio_target_i", -16.0))
-                    target_tp = float(getattr(settings, "segment_audio_target_tp", -1.5))
-                    target_lra = float(getattr(settings, "segment_audio_target_lra", 11.0))
+                    target_tp = float(
+                        getattr(settings, "segment_audio_target_tp", -1.5)
+                    )
+                    target_lra = float(
+                        getattr(settings, "segment_audio_target_lra", 11.0)
+                    )
                     loudnorm = (
                         f"loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:"
                         "print_format=summary"
@@ -351,11 +500,13 @@ class FFMpegVideoRenderer(IVideoRenderer):
             elif kind == "draw_text":
                 # Prefer robust handling of newlines: if multiline, render each line as a separate drawtext
                 raw_text = str(op.get("text", ""))
-                # Normalize literal "\\n" to real newlines for processing
-                file_text = raw_text.replace("\\n", "\n")
+                file_text = _normalize_text(raw_text)
                 start = float(op.get("start", 0))
                 dur = float(op.get("duration", 0))
                 end = start + dur if dur > 0 else start
+                # Format times to avoid long float tails (e.g., 2.0700000000000003)
+                start_s = _fmt_time(start)
+                end_s = _fmt_time(end + 1e-6)  # small epsilon to avoid boundary issues
                 pos = op.get("position", {}) or {}
                 x = pos.get("x", "(w-text_w)/2")
                 y = pos.get("y", "(h-text_h)/2")
@@ -369,54 +520,168 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 color = (
                     style.get("color") if isinstance(style, dict) else None
                 ) or font.get("color", "white")
-                family = (
-                    style.get("family") if isinstance(style, dict) else None
-                ) or "default"
-                # Map family to a concrete font file (infra responsibility)
-                family_map = {
-                    "default": "fonts/Roboto-Black.ttf",
-                    "sans": "fonts/Roboto-Black.ttf",
-                    "serif": "fonts/Roboto-Black.ttf",
-                }
-                fontfile = font.get("file") or family_map.get(
-                    family, family_map["default"]
-                )
+                # family/fontfile previously used for drawtext; ASS uses Fontname in styles instead
                 box = op.get("box", {}) or {}
                 box_enabled = 1 if box.get("enabled", True) else 0
                 boxcolor = box.get("color", "black@0.4")
-                enable = f"between(t,{start},{end})"
-                # If multiline, render each line independently so each one is horizontally centered
+                # Collect as ASS subtitle events instead of chaining drawtext
+                # Flatten to single-line for subtitles; preserve explicit newlines
                 if "\n" in file_text:
                     lines = file_text.splitlines()
-                    # Force center x for multiline to avoid caller-provided absolute x causing left alignment
-                    x_center = "(w-text_w)/2"
                     for i, line in enumerate(lines):
-                        line_text = (
-                            line.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-                        )
-                        # Increment y per line by approx line height (fontsize + small gap)
-                        y_i = f"{y}+{i}*({fontsize}+8)"
-                        video_filters.append(
-                            "drawtext="
-                            f"fontfile='{fontfile}':text='{line_text}':"
-                            f"fontcolor={color}:fontsize={fontsize}:x={x_center}:y={y_i}:"
-                            f"box={box_enabled}:boxcolor={boxcolor}:"
-                            f"enable='{enable}'"
+                        # Rough vertical stacking: offset by line height
+                        px, py, an = _parse_pos(x, y, width, height)
+                        # stack lines by increasing py upward per line
+                        py_i = max(0, py - i * (fontsize + 8))
+                        ass_events.append(
+                            {
+                                "text": line,
+                                "start": start_s,
+                                "end": end_s,
+                                "fontsize": fontsize,
+                                "color": color,
+                                "box_enabled": box_enabled,
+                                "boxcolor": boxcolor,
+                                "pos_x": px,
+                                "pos_y": py_i,
+                                "align": an,
+                            }
                         )
                 else:
-                    # Single-line: use inline text (simpler and avoids extra files)
-                    text_inline = (
-                        file_text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-                    )
-                    video_filters.append(
-                        "drawtext="
-                        f"fontfile='{fontfile}':text='{text_inline}':"
-                        f"fontcolor={color}:fontsize={fontsize}:x={x}:y={y}:"
-                        f"box={box_enabled}:boxcolor={boxcolor}:"
-                        f"enable='{enable}'"
+                    px, py, an = _parse_pos(x, y, width, height)
+                    ass_events.append(
+                        {
+                            "text": file_text,
+                            "start": start_s,
+                            "end": end_s,
+                            "fontsize": fontsize,
+                            "color": color,
+                            "box_enabled": box_enabled,
+                            "boxcolor": boxcolor,
+                            "pos_x": px,
+                            "pos_y": py,
+                            "align": an,
+                        }
                     )
 
+        # If we have subtitle events, generate an ASS file and use subtitles filter
+        if ass_events:
+            try:
+
+                def _ass_time(s: str) -> str:
+                    # s is already a short decimal string; convert to H:MM:SS.cs
+                    try:
+                        t = float(s)
+                    except Exception:
+                        t = 0.0
+                    hh = int(t // 3600)
+                    mm = int((t % 3600) // 60)
+                    ss = int(t % 60)
+                    cs = int(round((t - int(t)) * 100))
+                    return f"{hh}:{mm:02d}:{ss:02d}.{cs:02d}"
+
+                ass_lines: list[str] = []
+                ass_lines.append("[Script Info]")
+                ass_lines.append("ScriptType: v4.00+")
+                ass_lines.append(f"PlayResX: {width}")
+                ass_lines.append(f"PlayResY: {height}")
+                ass_lines.append("ScaledBorderAndShadow: yes")
+                ass_lines.append("")
+                ass_lines.append("[V4+ Styles]")
+                ass_lines.append(
+                    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
+                )
+                # BorderStyle=3 uses an opaque box with BackColour; Outline/Shadow set to 0
+                # Primary/Back colours are defaults; per-line overrides will adjust as needed
+                ass_lines.append(
+                    "Style: Default,Roboto,32,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,3,0,0,2,20,20,36,0"
+                )
+                ass_lines.append("")
+                ass_lines.append("[Events]")
+                ass_lines.append(
+                    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+                )
+                for ev in ass_events:
+                    txt = ev.get("text", "")
+                    # Escape ASS special braces and newlines
+                    txt = (
+                        txt.replace("{", "\\{").replace("}", "\\}").replace("\n", "\\N")
+                    )
+                    st = _ass_time(ev.get("start", "0"))
+                    en = _ass_time(ev.get("end", "0"))
+                    # Build override tags for font size, primary color, and background box colour/alpha
+                    fs = int(ev.get("fontsize", 32))
+                    # Primary text color (ASS expects BBGGRR in &H00BBGGRR)
+                    pr = _parse_color(str(ev.get("color", "white")), (255, 255, 255))
+                    pr_r, pr_g, pr_b, _ = pr
+                    primary = f"&H00{pr_b:02X}{pr_g:02X}{pr_r:02X}"
+                    # Back colour from box setting; if box disabled, use fully transparent
+                    be = int(ev.get("box_enabled", 0))
+                    br, bg, bb, bop = _parse_color(
+                        str(ev.get("boxcolor", "black@0.4")), (0, 0, 0)
+                    )
+                    # ASS alpha: 00 opaque, FF fully transparent. 'opacity' ~ how opaque we want.
+                    back_alpha = (
+                        max(0, min(255, int(round((1.0 - bop) * 255)))) if be else 255
+                    )
+                    back = f"&H{back_alpha:02X}{bb:02X}{bg:02X}{br:02X}"
+                    # BorderStyle=3 uses BackColour; also ensure no outline/shadow
+                    px = int(ev.get("pos_x", width // 2))
+                    py = int(ev.get("pos_y", int(height * 0.92)))
+                    an = int(ev.get("align", 2))
+                    override = f"{{\\an{an}\\pos({px},{py})\\fs{fs}\\1c{primary}\\3a&HFF\\4c{back}\\bord0\\shad0}}"
+                    ass_lines.append(
+                        f"Dialogue: 0,{st},{en},Default,,0,0,36,,{override}{txt}"
+                    )
+
+                ass_path = Path(output_path).parent / "overlay.ass"
+                ass_path.write_text("\n".join(ass_lines), encoding="utf-8")
+                # Prepend subtitles filter; keep other non-text filters intact
+                video_filters.append(f"subtitles='{str(ass_path)}'")
+            except Exception:
+                # If ASS generation fails, proceed without subtitles (may still work for simple cases)
+                pass
+
+        # Assemble video/audio filter specs. Prefer filter_script for long graphs.
+        vf_spec = ",".join(video_filters) if video_filters else "null"
+        af_spec = ",".join(audio_filters) if audio_filters else "anull"
+        use_filter_script = False
+        vf_script_path: Path | None = None
+        try:
+            # Heuristic threshold: if filtergraph is long/complex, use -filter_script:v
+            if len(vf_spec) > 800 or "subtitles=" in vf_spec:
+                vf_script_path = Path(output_path).parent / "vf.txt"
+                vf_script_path.write_text(vf_spec, encoding="utf-8")
+                use_filter_script = True
+                logger.debug(
+                    "Using filter_script for video filters at %s (len=%d)",
+                    str(vf_script_path),
+                    len(vf_spec),
+                )
+        except Exception as _e:
+            # Fallback to inline -vf
+            use_filter_script = False
+            vf_script_path = None
+
         total_duration = float(plan.get("duration", 4.0))
+        # Common args for filters
+        vf_args = (
+            ["-filter_script:v", str(vf_script_path)]
+            if use_filter_script and vf_script_path
+            else ["-vf", vf_spec]
+        )
+        af_args = ["-af", af_spec]
+
+        def _audio_input_args(vpath: str | None) -> list[str]:
+            if vpath and os.path.exists(vpath):
+                return ["-i", vpath]
+            return [
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=44100",
+            ]
+
         if input_type == "video":
             cmd = [
                 settings.ffmpeg_binary_path,
@@ -424,22 +689,12 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 "-threads",
                 threads,
             ]
-            if voice_path and os.path.exists(voice_path):
-                cmd += ["-i", voice_path]
-            else:
-                cmd += [
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "anullsrc=channel_layout=stereo:sample_rate=44100",
-                ]
+            cmd += _audio_input_args(voice_path)
             cmd += [
                 "-i",
                 input_media,
-                "-vf",
-                ",".join(video_filters) if video_filters else "null",
-                "-af",
-                ",".join(audio_filters) if audio_filters else "anull",
+                *vf_args,
+                *af_args,
                 "-t",
                 str(total_duration),
                 "-map",
@@ -469,20 +724,10 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 "-i",
                 input_media,
             ]
-            if voice_path and os.path.exists(voice_path):
-                cmd += ["-i", voice_path]
-            else:
-                cmd += [
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "anullsrc=channel_layout=stereo:sample_rate=44100",
-                ]
+            cmd += _audio_input_args(voice_path)
             cmd += [
-                "-vf",
-                ",".join(video_filters) if video_filters else "null",
-                "-af",
-                ",".join(audio_filters) if audio_filters else "anull",
+                *vf_args,
+                *af_args,
                 "-t",
                 str(total_duration),
                 "-pix_fmt",
@@ -505,7 +750,11 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 stderr = (getattr(result, "stderr", None) or "").strip()
                 if stderr:
                     # Keep log size reasonable; ffmpeg prints lots of lines
-                    preview = stderr if len(stderr) < 8000 else stderr[:8000] + "... [truncated]"
+                    preview = (
+                        stderr
+                        if len(stderr) < 8000
+                        else stderr[:8000] + "... [truncated]"
+                    )
                     logger.info("[loudnorm-summary]\n%s", preview)
             except Exception:
                 # Do not fail rendering due to logging issues
@@ -639,7 +888,9 @@ class FFMpegVideoRenderer(IVideoRenderer):
         ops.append({"op": "pixel_format", "format": "yuv420p"})
 
         # Helper: wrap long text into multiple lines using a simple width heuristic
-        def _wrap_text_to_width(text: str, fontsize: int, max_width_pct: float = 0.9) -> str:
+        def _wrap_text_to_width(
+            text: str, fontsize: int, max_width_pct: float = 0.9
+        ) -> str:
             """Wrap text into multiple lines so the longest line width ~= canvas_width * max_width_pct.
 
             Heuristic: avg_char_width ≈ fontsize * 0.6 (works reasonably for Roboto Black).
@@ -684,11 +935,10 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 continue
 
             transform_type = transform.get("type")
-
-            if transform_type == "canvas_fit":
-                # Map abstract canvas_fit to concrete scale operation
-                fit_mode = transform.get("fit_mode", "contain")
-                fill_color = transform.get("fill_color", "black")
+            # Dispatch table simplifies transform -> ops mapping
+            def _build_canvas_fit(t: dict) -> None:
+                fit_mode = t.get("fit_mode", "contain")
+                fill_color = t.get("fill_color", "black")
                 ops.append(
                     {
                         "op": "fit_canvas",
@@ -698,35 +948,32 @@ class FFMpegVideoRenderer(IVideoRenderer):
                         "background": fill_color,
                     }
                 )
-            elif transform_type == "audio_normalize":
-                # Request per-segment audio loudness normalization
+
+            def _build_audio_normalize(t: dict) -> None:
                 ops.append({"op": "audio_normalize"})
-            elif transform_type == "audio_delay":
-                # Pass through to renderer as an op with milliseconds
-                ms = int(transform.get("milliseconds", 0) or 0)
+
+            def _build_audio_delay(t: dict) -> None:
+                ms = int(t.get("milliseconds", 0) or 0)
                 if ms > 0:
                     ops.append({"op": "audio_delay", "milliseconds": ms})
-            elif transform_type == "transition":
-                # Map abstract transition to concrete fade
-                target = "video" if transform.get("target") == "visual" else "audio"
-                direction = transform.get("direction", "in")
-                start = float(transform.get("start", 0))
-                dur = float(transform.get("duration", 0))
 
+            def _build_transition(t: dict) -> None:
+                target = "video" if t.get("target") == "visual" else "audio"
+                direction = t.get("direction", "in")
+                start = float(t.get("start", 0))
+                dur = float(t.get("duration", 0))
                 fade_spec = {direction: {"start": start, "duration": dur}}
                 ops.append({"op": "fade", "target": target, **fade_spec})
-            elif transform_type == "text_overlay":
-                # Map abstract text overlay to concrete draw_text
-                content = transform.get("content", "")
-                timing = transform.get("timing", {})
-                appearance = transform.get("appearance", {})
-                layout = transform.get("layout", {})
-                background = transform.get("background", {})
-                # Compute fontsize now for wrapping heuristic
+
+            def _build_text_overlay(t: dict) -> None:
+                content = t.get("content", "")
+                timing = t.get("timing", {})
+                appearance = t.get("appearance", {})
+                layout = t.get("layout", {})
+                background = t.get("background", {})
                 fontsize_for_wrap = int(appearance.get("size", 42))
                 max_width_pct = float(layout.get("max_width_pct", 0.9))
                 wrapped = _wrap_text_to_width(str(content), fontsize_for_wrap, max_width_pct)
-
                 ops.append(
                     {
                         "op": "draw_text",
@@ -740,7 +987,6 @@ class FFMpegVideoRenderer(IVideoRenderer):
                         },
                         "position": {
                             "x": layout.get("x", "(w-text_w)/2"),
-                            # Default to bottom placement with small margin
                             "y": layout.get("y", "h-text_h-20"),
                         },
                         "box": {
@@ -749,6 +995,18 @@ class FFMpegVideoRenderer(IVideoRenderer):
                         },
                     }
                 )
+
+            TRANSFORM_BUILDERS = {
+                "canvas_fit": _build_canvas_fit,
+                "audio_normalize": _build_audio_normalize,
+                "audio_delay": _build_audio_delay,
+                "transition": _build_transition,
+                "text_overlay": _build_text_overlay,
+            }
+
+            handler = TRANSFORM_BUILDERS.get(transform_type)
+            if handler:
+                handler(transform)
 
         return {
             "input_type": input_type,
