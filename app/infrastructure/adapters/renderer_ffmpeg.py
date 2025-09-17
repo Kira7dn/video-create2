@@ -405,8 +405,11 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 d = round(float(val), ndigits)
             except Exception:
                 d = float(val)
-            s = f"{d:.{ndigits}f}".rstrip("0").rstrip(".")
-            return s if s else "0"
+            # Keep at least one decimal place to satisfy tests expecting '1.0'
+            s = f"{d:.{ndigits}f}".rstrip("0")
+            if s.endswith("."):
+                s = s + "0"
+            return s if s else "0.0"
 
         def add_fade(target: str, spec: dict):
             if not isinstance(spec, dict):
@@ -498,19 +501,17 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 target = op.get("target", "video")
                 add_fade(target, op)
             elif kind == "draw_text":
-                # Prefer robust handling of newlines: if multiline, render each line as a separate drawtext
+                # Always collect text as ASS subtitle events (drop drawtext path)
                 raw_text = str(op.get("text", ""))
                 file_text = _normalize_text(raw_text)
                 start = float(op.get("start", 0))
                 dur = float(op.get("duration", 0))
                 end = start + dur if dur > 0 else start
-                # Format times to avoid long float tails (e.g., 2.0700000000000003)
                 start_s = _fmt_time(start)
-                end_s = _fmt_time(end + 1e-6)  # small epsilon to avoid boundary issues
+                end_s = _fmt_time(end + 1e-6)
                 pos = op.get("position", {}) or {}
                 x = pos.get("x", "(w-text_w)/2")
                 y = pos.get("y", "(h-text_h)/2")
-                # Back-compat: accept either 'font' or abstract 'style'
                 style = op.get("style") or {}
                 font = op.get("font") or {}
                 fontsize = int(
@@ -520,19 +521,15 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 color = (
                     style.get("color") if isinstance(style, dict) else None
                 ) or font.get("color", "white")
-                # family/fontfile previously used for drawtext; ASS uses Fontname in styles instead
                 box = op.get("box", {}) or {}
                 box_enabled = 1 if box.get("enabled", True) else 0
                 boxcolor = box.get("color", "black@0.4")
-                # Collect as ASS subtitle events instead of chaining drawtext
-                # Flatten to single-line for subtitles; preserve explicit newlines
+
                 if "\n" in file_text:
                     lines = file_text.splitlines()
                     for i, line in enumerate(lines):
-                        # Rough vertical stacking: offset by line height
                         px, py, an = _parse_pos(x, y, width, height)
-                        # stack lines by increasing py upward per line
-                        py_i = max(0, py - i * (fontsize + 8))
+                        py_i = min(height - 1, py + i * (fontsize + 8))
                         ass_events.append(
                             {
                                 "text": line,
@@ -591,10 +588,14 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 ass_lines.append(
                     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
                 )
-                # BorderStyle=3 uses an opaque box with BackColour; Outline/Shadow set to 0
-                # Primary/Back colours are defaults; per-line overrides will adjust as needed
+                # Two base styles:
+                # - DefaultOutline: crisp white text with black outline & slight shadow (no box)
+                # - DefaultBox: text over semi-transparent black box (no outline/shadow)
                 ass_lines.append(
-                    "Style: Default,Roboto,32,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,3,0,0,2,20,20,36,0"
+                    "Style: DefaultOutline,Roboto,36,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,1,2,1,2,40,40,80,0"
+                )
+                ass_lines.append(
+                    "Style: DefaultBox,Roboto,36,&H00FFFFFF,&H000000FF,&H00000000,&H7F000000,0,0,0,0,100,100,0,0,3,0,0,2,40,40,80,0"
                 )
                 ass_lines.append("")
                 ass_lines.append("[Events]")
@@ -609,7 +610,7 @@ class FFMpegVideoRenderer(IVideoRenderer):
                     )
                     st = _ass_time(ev.get("start", "0"))
                     en = _ass_time(ev.get("end", "0"))
-                    # Build override tags for font size, primary color, and background box colour/alpha
+                    # Build override tags for font size, primary color, and background/outline
                     fs = int(ev.get("fontsize", 32))
                     # Primary text color (ASS expects BBGGRR in &H00BBGGRR)
                     pr = _parse_color(str(ev.get("color", "white")), (255, 255, 255))
@@ -629,9 +630,17 @@ class FFMpegVideoRenderer(IVideoRenderer):
                     px = int(ev.get("pos_x", width // 2))
                     py = int(ev.get("pos_y", int(height * 0.92)))
                     an = int(ev.get("align", 2))
-                    override = f"{{\\an{an}\\pos({px},{py})\\fs{fs}\\1c{primary}\\3a&HFF\\4c{back}\\bord0\\shad0}}"
+                    if be:
+                        # Box style: use DefaultBox (BorderStyle=3), no outline/shadow; control box via BackColour
+                        style_name = "DefaultBox"
+                        override = f"{{\\an{an}\\pos({px},{py})\\fs{fs}\\1c{primary}\\4c{back}\\bord0\\shad0}}"
+                    else:
+                        # Outline style: use DefaultOutline with subtle shadow; ensure outline color black
+                        style_name = "DefaultOutline"
+                        outline_color = "&H00000000"  # &H00BBGGRR for black
+                        override = f"{{\\an{an}\\pos({px},{py})\\fs{fs}\\1c{primary}\\3c{outline_color}\\bord2\\shad1}}"
                     ass_lines.append(
-                        f"Dialogue: 0,{st},{en},Default,,0,0,36,,{override}{txt}"
+                        f"Dialogue: 0,{st},{en},{style_name},,0,0,80,,{override}{txt}"
                     )
 
                 ass_path = Path(output_path).parent / "overlay.ass"
@@ -935,6 +944,7 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 continue
 
             transform_type = transform.get("type")
+
             # Dispatch table simplifies transform -> ops mapping
             def _build_canvas_fit(t: dict) -> None:
                 fit_mode = t.get("fit_mode", "contain")
@@ -973,7 +983,9 @@ class FFMpegVideoRenderer(IVideoRenderer):
                 background = t.get("background", {})
                 fontsize_for_wrap = int(appearance.get("size", 42))
                 max_width_pct = float(layout.get("max_width_pct", 0.9))
-                wrapped = _wrap_text_to_width(str(content), fontsize_for_wrap, max_width_pct)
+                wrapped = _wrap_text_to_width(
+                    str(content), fontsize_for_wrap, max_width_pct
+                )
                 ops.append(
                     {
                         "op": "draw_text",

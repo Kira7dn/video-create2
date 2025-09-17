@@ -29,6 +29,7 @@ class CreateSegmentClipsStep(BaseStep):
         *,
         canvas_width: int,
         canvas_height: int,
+        fit_mode: str,
     ) -> dict:
         seg = segment or {}
         video_path = (
@@ -100,17 +101,16 @@ class CreateSegmentClipsStep(BaseStep):
 
         # Build abstract transformations
         transformations: list[dict] = []
-        # For dynamic content, fit into target canvas (static content was preprocessed earlier)
-        if input_type == "video":
-            transformations.append(
-                {
-                    "type": "canvas_fit",
-                    "canvas_width": int(canvas_width),
-                    "canvas_height": int(canvas_height),
-                    "fit_mode": "contain",
-                    "fill_color": "black",
-                }
-            )
+        # Fit into target canvas for both image and video; choose contain/cover by fit_mode
+        transformations.append(
+            {
+                "type": "canvas_fit",
+                "canvas_width": int(canvas_width),
+                "canvas_height": int(canvas_height),
+                "fit_mode": str(fit_mode or "contain"),
+                "fill_color": "black",
+            }
+        )
         # If we have audio, ensure proper handling
         if voice_path:
             transformations.append({"type": "audio_normalize"})
@@ -244,14 +244,21 @@ class CreateSegmentClipsStep(BaseStep):
         if not isinstance(segments, list):
             raise ValueError("segments must be a list")
         clips = []
+        # Determine video type (default to 'long') and canvas size
+        validated = context.get("validated_data") or {}
+        video_type = (validated.get("video_type") if isinstance(validated, dict) else None) or "long"
+        canvas_width, canvas_height = settings.video_resolution_tuple_for(video_type)
+        frame_rate = getattr(settings, "video_default_fps", 30)
+        # Determine fit mode: for vertical short content prefer 'cover' (crop), else 'contain' (pad)
+        fit_mode = "cover" if video_type == "short" else "contain"
         for idx, seg in enumerate(segments):
             # Let adapter handle temp_dir and file extensions
             seg_id = seg.get("id", f"seg_{idx}")
-            # Resolve defaults from settings
-            canvas_width, canvas_height = settings.video_resolution_tuple
-            frame_rate = getattr(settings, "video_default_fps", 30)
             specification = await self._build_specification(
-                seg, canvas_width=canvas_width, canvas_height=canvas_height
+                seg,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+                fit_mode=fit_mode,
             )
             clip_out = await self.renderer.process_with_specification(
                 specification,

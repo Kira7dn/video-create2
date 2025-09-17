@@ -13,6 +13,7 @@ class IImageProcessor(Protocol):
         seg_id: str | None = None,
         smart_pad_color: bool = True,
         pad_color_method: str = "average_edge",
+        mode: str = "contain",
         auto_enhance: bool = True,
         enhance_brightness: bool = True,
         enhance_contrast: bool = True,

@@ -76,7 +76,9 @@ class Settings(BaseSettings):
     video_default_fps: int = 24
     video_default_codec: str = "libx264"
     video_default_audio_codec: str = "aac"
-    video_default_resolution: str = "1920,1080"
+    # Video type specific presets
+    video_resolution_long: str = "1280,720"
+    video_resolution_short: str = "1080,1920"
 
     # Asset Processing Settings
     segment_asset_types: dict = {
@@ -230,34 +232,42 @@ class Settings(BaseSettings):
         "env_file": ".env",
         "env_file_encoding": "utf-8",
         "case_sensitive": False,
+        # Allow unknown/legacy env vars without failing validation (e.g., VIDEO_DEFAULT_RESOLUTION)
+        "extra": "ignore",
     }
 
     @property
-    def video_resolution_tuple(self) -> tuple:
-        """Get video resolution as tuple"""
-        if isinstance(self.video_default_resolution, str):
-            try:
-                parts = self.video_default_resolution.split(",")
-                if len(parts) == 2:
-                    return (int(parts[0]), int(parts[1]))
-            except (ValueError, AttributeError):
-                pass
-        return (1920, 1080)  # Default fallback
+    def video_long_resolution_tuple(self) -> tuple:
+        """Resolution tuple for long video (landscape)."""
+        try:
+            parts = str(self.video_resolution_long).split(",")
+            if len(parts) == 2:
+                return (int(parts[0]), int(parts[1]))
+        except Exception:
+            pass
+        return (1280, 720)
 
-    @field_validator("video_default_resolution")
-    @classmethod
-    def parse_resolution(cls, v):
-        """Validate resolution format"""
-        if isinstance(v, str):
-            try:
-                parts = v.split(",")
-                if len(parts) == 2:
-                    int(parts[0])  # Validate width
-                    int(parts[1])  # Validate height
-                    return v
-            except (ValueError, AttributeError):
-                return "1920,1080"  # Default fallback
-        return "1920,1080"
+    @property
+    def video_short_resolution_tuple(self) -> tuple:
+        """Resolution tuple for short video (vertical)."""
+        try:
+            parts = str(self.video_resolution_short).split(",")
+            if len(parts) == 2:
+                return (int(parts[0]), int(parts[1]))
+        except Exception:
+            pass
+        return (1080, 1920)
+
+    def video_resolution_tuple_for(self, video_type: str | None) -> tuple:
+        """Return resolution tuple based on video_type ('short' or 'long').
+
+        Defaults to long if video_type is missing or unrecognized.
+        """
+        vt = (video_type or "long").strip().lower()
+        if vt == "short":
+            return self.video_short_resolution_tuple
+        return self.video_long_resolution_tuple
+
 
 
 # Global settings instance

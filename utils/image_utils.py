@@ -109,6 +109,7 @@ def process_image(
     pad_color=(0, 0, 0),
     smart_pad_color: bool = False,
     pad_color_method: str = "average_edge",
+    mode: str = "contain",  # 'contain' (pad) or 'cover' (crop)
     auto_enhance: bool = False,
     enhance_brightness: bool = True,
     enhance_contrast: bool = True,
@@ -118,7 +119,9 @@ def process_image(
     return_arrays: bool = False,
 ) -> Union[List, List[str]]:
     """
-    Load, resize và padding ảnh về đúng target_size (w, h), giữ nguyên tỉ lệ.
+    Load, resize ảnh về đúng target_size (w, h), giữ nguyên tỉ lệ.
+    - mode='contain': fit vào khung và padding phần thừa (pad)
+    - mode='cover': phóng lớn và crop phần thừa (crop)
 
     Args:
         image_paths: Đường dẫn ảnh (string) hoặc list đường dẫn
@@ -167,36 +170,50 @@ def process_image(
 
         h, w = img.shape[:2]
 
-        scale = min(target_w / w, target_h / h)
-        new_w, new_h = int(w * scale), int(h * scale)
-
-        # Ensure resized dimensions are also even
-        new_w = new_w - (new_w % 2)
-        new_h = new_h - (new_h % 2)
-
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        pad_left = (target_w - new_w) // 2
-        pad_right = target_w - new_w - pad_left
-        pad_top = (target_h - new_h) // 2
-        pad_bottom = target_h - new_h - pad_top
-
-        # Determine padding color (use enhanced image for smart padding)
-        if smart_pad_color:
-            actual_pad_color = get_smart_pad_color(img, pad_color_method)
+        if str(mode).lower() == "cover":
+            # Scale to cover then center-crop
+            scale = max(target_w / w, target_h / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            # Ensure even
+            new_w = new_w - (new_w % 2)
+            new_h = new_h - (new_h % 2)
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            # Center crop to target
+            x_start = max(0, (new_w - target_w) // 2)
+            y_start = max(0, (new_h - target_h) // 2)
+            cropped = resized[y_start : y_start + target_h, x_start : x_start + target_w]
+            # Safety: if rounding produced off-by-one
+            cropped = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            processed.append(cropped)
         else:
-            actual_pad_color = pad_color
+            # Default: contain with padding
+            scale = min(target_w / w, target_h / h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            # Ensure even
+            new_w = new_w - (new_w % 2)
+            new_h = new_h - (new_h % 2)
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            pad_left = (target_w - new_w) // 2
+            pad_right = target_w - new_w - pad_left
+            pad_top = (target_h - new_h) // 2
+            pad_bottom = target_h - new_h - pad_top
 
-        padded = cv2.copyMakeBorder(
-            resized,
-            pad_top,
-            pad_bottom,
-            pad_left,
-            pad_right,
-            borderType=cv2.BORDER_CONSTANT,
-            value=actual_pad_color,
-        )
+            # Determine padding color (use enhanced image for smart padding)
+            if smart_pad_color:
+                actual_pad_color = get_smart_pad_color(img, pad_color_method)
+            else:
+                actual_pad_color = pad_color
 
-        processed.append(padded)
+            padded = cv2.copyMakeBorder(
+                resized,
+                pad_top,
+                pad_bottom,
+                pad_left,
+                pad_right,
+                borderType=cv2.BORDER_CONSTANT,
+                value=actual_pad_color,
+            )
+            processed.append(padded)
 
         # Save processed image if output_dir is provided
         if output_dir and not return_arrays:

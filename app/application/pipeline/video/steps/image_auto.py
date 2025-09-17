@@ -22,6 +22,7 @@ class ImageAutoStep(BaseStep):
     Validate segment images and auto-replace invalid ones using Pixabay.
     Optionally enhances keyword search via PydanticAI when enabled.
     """
+
     name = "image_auto"
     required_keys = ["segments"]
 
@@ -36,6 +37,8 @@ class ImageAutoStep(BaseStep):
         self.downloader = downloader
         self.image_search = image_search
         self.image_processor = image_processor
+        # Expose pipeline context to helper methods (initialized here to satisfy linters)
+        self._ctx: Optional[PipelineContext] = None
         # Configure retry/timeout for network + processing work
         self.retries = int(getattr(settings, "image_auto_retries", 1))
         self.retry_backoff = float(getattr(settings, "image_auto_retry_backoff", 0.5))
@@ -78,21 +81,54 @@ class ImageAutoStep(BaseStep):
         min_height: Optional[int] = None,
     ) -> Optional[str]:
         """AI-enhanced Pixabay search, with fallback."""
-        min_width = min_width or settings.video_min_image_width
-        min_height = min_height or settings.video_min_image_height
+        # Determine canvas target size by video_type to avoid upscaling
+        # Try to access context via closure (set in run); fallback to settings defaults
+        try:
+            # This attribute will be set in run() just before calling helpers
+            ctx: PipelineContext = getattr(self, "_ctx", None)  # type: ignore[name-defined]
+            if ctx is not None:
+                vd = ctx.get("validated_data") or {}
+                vtype = (
+                    vd.get("video_type") if isinstance(vd, dict) else None
+                ) or "long"
+            else:
+                vtype = "long"
+        except Exception:
+            vtype = "long"
+
+        canvas_w, canvas_h = settings.video_resolution_tuple_for(str(vtype))
+        # Base constraints: at least canvas size or configured minima (unless caller provided stricter)
+        base_min_w = int(min_width or max(settings.video_min_image_width, canvas_w))
+        base_min_h = int(min_height or max(settings.video_min_image_height, canvas_h))
 
         keywords_list = await self._ai_extract_keywords(content, fields)
 
-        for keywords in keywords_list:
-            url = self.image_search.search_image(keywords, min_width, min_height)
-            if url:
-                logger.info("✅ Found image with keywords '%s'", keywords)
-                return url
+        # Progressive relax: try with decreasing size requirements
+        relax_factors = [1.0, 0.9, 0.8]  # up to 20% relax
+        for factor in relax_factors:
+            req_w = max(settings.video_min_image_width, int(base_min_w * factor))
+            req_h = max(settings.video_min_image_height, int(base_min_h * factor))
+            try:
+                logger.info(
+                    "🖼️ Image search (video_type=%s) with min_size=%dx%d (factor=%.2f)",
+                    vtype,
+                    req_w,
+                    req_h,
+                    factor,
+                )
+            except Exception:
+                pass
+            for keywords in keywords_list:
+                url = self.image_search.search_image(keywords, req_w, req_h)
+                if url:
+                    logger.info("✅ Found image with keywords '%s' at %dx%d", keywords, req_w, req_h)
+                    return url
 
         # Final fallback
-        return self.image_search.search_image(
-            "abstract background", min_width, min_height
-        )
+        # Try a generic background with the most relaxed constraints
+        last_w = max(settings.video_min_image_width, int(base_min_w * relax_factors[-1]))
+        last_h = max(settings.video_min_image_height, int(base_min_h * relax_factors[-1]))
+        return self.image_search.search_image("abstract background", last_w, last_h)
 
     async def _download_image(self, content: str, fields: List[str]) -> Tuple[str, str]:
         """Search and download an image via the injected downloader; return (url, local_path)."""
@@ -110,6 +146,8 @@ class ImageAutoStep(BaseStep):
 
     async def run(self, context: PipelineContext) -> None:  # type: ignore[override]
         """Validate/replace images directly on context.segments."""
+        # Expose context for helper methods (e.g., to read validated_data.video_type)
+        self._ctx = context  # type: ignore[attr-defined]
         segments: List[dict] = context.get("segments") or []
         keywords = context.get("keywords")  # Optional[List[str]]
         min_width = settings.video_min_image_width
@@ -147,14 +185,27 @@ class ImageAutoStep(BaseStep):
             # Uses fixed resolution from settings; writes to a local tmp directory
             if not video_obj and merged.get("image"):
                 try:
-                    width, height = settings.video_resolution_tuple
+                    # Determine canvas size based on validated video_type (default to 'long')
+                    validated = context.get("validated_data") or {}
+                    video_type = (
+                        validated.get("video_type")
+                        if isinstance(validated, dict)
+                        else None
+                    ) or "long"
+                    width, height = settings.video_resolution_tuple_for(str(video_type))
+                    fit_mode = "cover" if str(video_type).lower() == "short" else "contain"
                     img_path = merged["image"].get("local_path")
                     if img_path:
                         processed_list = await self.image_processor.process(
                             img_path,
                             target_width=width,
                             target_height=height,
-                            seg_id=str(merged.get("id")) if merged.get("id") is not None else None,
+                            mode=fit_mode,
+                            seg_id=(
+                                str(merged.get("id"))
+                                if merged.get("id") is not None
+                                else None
+                            ),
                             smart_pad_color=True,
                             pad_color_method="average_edge",
                             auto_enhance=True,
