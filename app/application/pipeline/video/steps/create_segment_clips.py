@@ -13,15 +13,6 @@ class CreateSegmentClipsStep(BaseStep):
 
     def __init__(self, renderer: IVideoRenderer):
         self.renderer = renderer
-        # Renderer operations can be flaky/slow; set conservative retry/timeout
-        self.retries = int(getattr(settings, "create_clips_retries", 1))
-        self.retry_backoff = float(getattr(settings, "create_clips_retry_backoff", 0.5))
-        self.max_backoff = float(getattr(settings, "create_clips_max_backoff", 3.0))
-        self.jitter = float(getattr(settings, "create_clips_jitter", 0.2))
-        self.use_exponential_backoff = bool(
-            getattr(settings, "create_clips_use_exp_backoff", True)
-        )
-        self.timeout = getattr(settings, "create_clips_timeout", None)
 
     async def _build_specification(
         self,
@@ -32,6 +23,69 @@ class CreateSegmentClipsStep(BaseStep):
         fit_mode: str,
     ) -> dict:
         seg = segment or {}
+        base_duration = float(
+            seg.get(
+                "duration", getattr(settings, "video_default_segment_duration", 4.0)
+            )
+        )
+        input_type, input_media, original_duration, voice_path = (
+            await self._determine_input_and_duration(seg)
+        )
+        transformations, total_duration, delay = await self._build_transformations(
+            seg, input_type, original_duration, canvas_width, canvas_height, fit_mode
+        )
+        text_overlays = self._build_text_overlays(seg, total_duration, delay)
+        transformations.extend(text_overlays)
+
+        specification = {
+            "source_type": "dynamic" if input_type == "video" else "static",
+            "primary_source": input_media,
+            "audio_source": voice_path,
+            "repeat_static": input_type == "image",
+            "transformations": transformations,
+            "duration": float(total_duration),
+        }
+        return specification
+
+    async def run(self, context: PipelineContext) -> None:  # type: ignore[override]
+        segments = context.get("segments") or []
+        if not isinstance(segments, list):
+            raise ValueError("segments must be a list")
+        clips = []
+        # Determine video type (default to 'long') and canvas size
+        validated = context.get("validated_data") or {}
+        video_type = (
+            validated.get("video_type") if isinstance(validated, dict) else None
+        ) or "long"
+        canvas_width, canvas_height = settings.video_resolution_tuple_for(video_type)
+        frame_rate = getattr(settings, "video_default_fps", 30)
+        # Determine fit mode: for vertical short content prefer 'cover' (crop), else 'contain' (pad)
+        fit_mode = "cover" if video_type == "short" else "contain"
+        for idx, seg in enumerate(segments):
+            # Let adapter handle temp_dir and file extensions
+            seg_id = seg.get("id", f"seg_{idx}")
+            specification = await self._build_specification(
+                seg,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+                fit_mode=fit_mode,
+            )
+            clip_out = await self.renderer.render_segment(
+                specification,
+                seg_id=seg_id,
+                canvas_width=canvas_width,
+                canvas_height=canvas_height,
+                frame_rate=frame_rate,
+            )
+
+            clip_id = seg.get("id", f"seg_{idx}")
+            clips.append({"id": clip_id, "path": clip_out})
+        context.set("segment_clips", clips)
+        return
+
+    async def _determine_input_and_duration(
+        self, seg: dict
+    ) -> tuple[str, Optional[str], float, Optional[str]]:
         video_path = (
             (seg.get("video") or {}).get("local_path")
             if isinstance(seg.get("video"), dict)
@@ -63,7 +117,7 @@ class CreateSegmentClipsStep(BaseStep):
             input_type = "video"
             input_media = video_path
             try:
-                original_duration = await self.renderer.get_media_duration(video_path)
+                original_duration = await self.renderer.duration(video_path)
             except Exception:
                 original_duration = base_duration
         else:
@@ -73,7 +127,7 @@ class CreateSegmentClipsStep(BaseStep):
             input_media = image_path
             if voice_path:
                 try:
-                    voice_len = await self.renderer.get_media_duration(voice_path)
+                    voice_len = await self.renderer.duration(voice_path)
                     # Include start_delay so fade-out starts after delayed voice end
                     start_delay_for_len = float(
                         (voice_over or {}).get("start_delay", 0) or 0
@@ -85,6 +139,38 @@ class CreateSegmentClipsStep(BaseStep):
                     original_duration = base_duration
             else:
                 original_duration = base_duration
+
+        return input_type, input_media, original_duration, voice_path
+
+    async def _build_transformations(
+        self,
+        seg: dict,
+        input_type: str,
+        original_duration: float,
+        canvas_width: int,
+        canvas_height: int,
+        fit_mode: str,
+    ) -> tuple[list[dict], float]:
+        transformations: list[dict] = []
+        # Fit into target canvas for both image and video; choose contain/cover by fit_mode
+        transformations.append(
+            {
+                "type": "canvas_fit",
+                "canvas_width": int(canvas_width),
+                "canvas_height": int(canvas_height),
+                "fit_mode": str(fit_mode or "contain"),
+                "fill_color": "black",
+            }
+        )
+        voice_over = seg.get("voice_over") or {}
+        voice_path = (
+            (voice_over or {}).get("local_path")
+            if isinstance(voice_over, dict)
+            else None
+        )
+        # If we have audio, ensure proper handling
+        if voice_path:
+            transformations.append({"type": "audio_normalize"})
 
         transition_in = seg.get("transition_in") or {}
         transition_out = seg.get("transition_out") or {}
@@ -98,22 +184,6 @@ class CreateSegmentClipsStep(BaseStep):
             if isinstance(transition_out, dict)
             else 0
         )
-
-        # Build abstract transformations
-        transformations: list[dict] = []
-        # Fit into target canvas for both image and video; choose contain/cover by fit_mode
-        transformations.append(
-            {
-                "type": "canvas_fit",
-                "canvas_width": int(canvas_width),
-                "canvas_height": int(canvas_height),
-                "fit_mode": str(fit_mode or "contain"),
-                "fill_color": "black",
-            }
-        )
-        # If we have audio, ensure proper handling
-        if voice_path:
-            transformations.append({"type": "audio_normalize"})
 
         if fade_in_duration > 0:
             transformations.append(
@@ -170,7 +240,6 @@ class CreateSegmentClipsStep(BaseStep):
         delay = fade_in_duration + start_delay
 
         # If audio has a configured delay, emit an explicit audio delay transform (ms)
-        # voice_delay = fade_in_duration + start_delay
         if delay > 0:
             transformations.append(
                 {
@@ -179,7 +248,9 @@ class CreateSegmentClipsStep(BaseStep):
                 }
             )
 
-        # Text overlays (processor-agnostic)
+        return transformations, total_duration, delay
+
+    def _build_text_overlays(self, seg: dict, total_duration: float, delay: float) -> list[dict]:
         text_overlays: list[dict] = []
         text_overs = seg.get("text_over", None)
         if text_overs:
@@ -226,49 +297,4 @@ class CreateSegmentClipsStep(BaseStep):
                 # Update prev_end in segment timeline (remove delay component)
                 prev_end = max(0.0, end - delay)
 
-        if text_overlays:
-            transformations.extend(text_overlays)
-
-        specification = {
-            "source_type": "dynamic" if input_type == "video" else "static",
-            "primary_source": input_media,
-            "audio_source": voice_path,
-            "repeat_static": input_type == "image",
-            "transformations": transformations,
-            "duration": float(total_duration),
-        }
-        return specification
-
-    async def run(self, context: PipelineContext) -> None:  # type: ignore[override]
-        segments = context.get("segments") or []
-        if not isinstance(segments, list):
-            raise ValueError("segments must be a list")
-        clips = []
-        # Determine video type (default to 'long') and canvas size
-        validated = context.get("validated_data") or {}
-        video_type = (validated.get("video_type") if isinstance(validated, dict) else None) or "long"
-        canvas_width, canvas_height = settings.video_resolution_tuple_for(video_type)
-        frame_rate = getattr(settings, "video_default_fps", 30)
-        # Determine fit mode: for vertical short content prefer 'cover' (crop), else 'contain' (pad)
-        fit_mode = "cover" if video_type == "short" else "contain"
-        for idx, seg in enumerate(segments):
-            # Let adapter handle temp_dir and file extensions
-            seg_id = seg.get("id", f"seg_{idx}")
-            specification = await self._build_specification(
-                seg,
-                canvas_width=canvas_width,
-                canvas_height=canvas_height,
-                fit_mode=fit_mode,
-            )
-            clip_out = await self.renderer.process_with_specification(
-                specification,
-                seg_id=seg_id,
-                canvas_width=canvas_width,
-                canvas_height=canvas_height,
-                frame_rate=frame_rate,
-            )
-
-            clip_id = seg.get("id", f"seg_{idx}")
-            clips.append({"id": clip_id, "path": clip_out})
-        context.set("segment_clips", clips)
-        return
+        return text_overlays

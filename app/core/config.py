@@ -139,14 +139,6 @@ class Settings(BaseSettings):
     ffmpeg_preset: str = "medium"
     ffmpeg_threads: int = 0  # 0 = auto
 
-    # Pipeline Step Defaults - CreateSegmentClipsStep
-    create_clips_retries: int = 1
-    create_clips_retry_backoff: float = 0.5
-    create_clips_max_backoff: float = 3.0
-    create_clips_jitter: float = 0.2
-    create_clips_use_exp_backoff: bool = True
-    create_clips_timeout: float | None = None
-
     # Download Settings
     download_timeout: int = 300  # 5 minutes for large video files
     download_max_concurrent: int = 10
@@ -267,7 +259,6 @@ class Settings(BaseSettings):
         if vt == "short":
             return self.video_short_resolution_tuple
         return self.video_long_resolution_tuple
-
 
 
 # Global settings instance

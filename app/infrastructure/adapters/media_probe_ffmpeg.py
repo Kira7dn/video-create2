@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from app.application.interfaces.media_probe import IMediaProbe
-from utils.subprocess_utils import safe_subprocess_run
+from app.infrastructure.adapters.renderer.utils.ffmpeg_utils import safe_subprocess_run
 
 
 class FFmpegMediaProbe(IMediaProbe):

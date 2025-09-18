@@ -1,62 +1,205 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
 import json
+import os
+import re
 import logging
-from dataclasses import dataclass
 from pathlib import Path
-import math
-
-from app.application.interfaces import ITextOverBuilder
-from utils.gentle_utils import filter_successful_words
-from utils.alignment_utils import find_greedy_shift_match, find_flexible_match
-from utils.text_utils import create_text_over_item, normalize_text
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ExpansionConfig:
-    """Configuration for text overlay expansion behavior."""
+def _approx_token_eq(a: str, b: str) -> bool:
+    """Approximate equality for tokens to handle simple inflections.
 
-    max_expand_s: float = (
-        0.250  # Maximum expansion per side (seconds) when no neighbor; with pad_s=0.08 → 0.33 (matches tests)
-    )
-    max_gap_s: float = 0.400  # Do not bridge gaps larger than this
-    pad_s: float = 0.080  # Visual padding when no neighbor exists
-    min_duration_s: float = 0.100  # Minimum overlay duration
-    lookahead_window: int = (
-        80  # Flexible match lookahead window (increased for robustness)
-    )
-    max_skips_per_side: int = 4  # Greedy match tolerance
-    similarity_threshold: float = 0.85  # Slightly relaxed to reduce overshoot misses
-    max_internal_gap_s: float = (
-        0.950  # Bridge sub-second internal gaps, but avoid crossing inter-line pauses (~>1s)
-    )
-    # Backoff search config: when initial flexible match fails, widen the window and allow a small look-back
-    backoff_lookback: int = 15
-    backoff_window: int = 140
-    # Optional: enforce a minimum duration for multi-word lines (>=4 tokens). Default disabled.
-    min_multiword_duration_s: float = 0.0
-
-
-class TextOverBuilder(ITextOverBuilder):
-    """Builds text_over items in alignment-only mode.
-
-    - Maps transcript chunks to aligned words using greedy shift matching.
-    - Falls back to a flexible partial match within a lookahead window if needed.
-    - Requires aligned word items; no text-only fallback is supported.
-    - Applies hybrid expansion to cover adjacent not-found words with conservative caps.
+    Rules kept minimal and deterministic:
+    - Exact match -> True
+    - Case-insensitive already handled by normalization in _tokens
+    - Strip possessive: trailing "'s" or "’s"
+    - Singularize basic English plurals:
+      * trailing 's' (length > 3)
+      * 'ies' -> 'y'
+      * 'es' for words ending with s, x, z, ch, sh
     """
 
+    if a == b:
+        return True
+
+    def singularize(t: str) -> str:
+        # strip possessive
+        if t.endswith("'s") or t.endswith("’s"):
+            t = t[:-2]
+        # common plural -> singular
+        if len(t) > 3 and t.endswith("ies"):
+            return t[:-3] + "y"
+        if len(t) > 3 and t.endswith("s"):
+            # handle -es for s, x, z, ch, sh
+            if t.endswith("es") and (
+                t[:-2].endswith("s")
+                or t[:-2].endswith("x")
+                or t[:-2].endswith("z")
+                or t[:-2].endswith("ch")
+                or t[:-2].endswith("sh")
+            ):
+                return t[:-2]
+            return t[:-1]
+        return t
+
+    return singularize(a) == singularize(b)
+
+
+def _normalize_text(s: str) -> str:
+    """Normalize text to match tokenization used in tests.
+
+    - Lowercase
+    - Replace hyphen-like characters with space
+    - Collapse multiple spaces
+    """
+    s2 = re.sub(r"[\-\u2010\u2011\u2012\u2013\u2014]", " ", s.lower())
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    return s2
+
+
+def _tokens(s: str) -> List[str]:
+    s2 = _normalize_text(s)
+    return re.findall(r"\b\w+\b", s2)
+
+
+def _is_finite_number(x: Any) -> bool:
+    try:
+        fx = float(x)
+    except Exception:
+        return False
+    return fx == fx and fx not in (float("inf"), float("-inf"))
+
+
+def _extract_success_words(word_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for w in word_items:
+        if not isinstance(w, dict):
+            continue
+        if w.get("case") != "success":
+            continue
+        if not ("start" in w and "end" in w):
+            continue
+        if not (_is_finite_number(w["start"]) and _is_finite_number(w["end"])):
+            continue
+        out.append(w)
+    return out
+
+
+def _build_word_token_list(success_words: List[Dict[str, Any]]) -> List[str]:
+    return [t for t in (_tokens(w.get("word", "")) for w in success_words) for t in t]
+
+
+def _find_subsequence_span(
+    tokens_line: List[str], tokens_words: List[str]
+) -> Tuple[int, int]:
+    """Find indices in tokens_words corresponding to the first and last token of tokens_line.
+
+    Greedy in-order matching: for each token in tokens_line, find the next occurrence
+    in tokens_words strictly after the previous match. Returns (first_index, last_index).
+    Raises ValueError if any token is not found in order.
+    """
+    if not tokens_line:
+        raise ValueError("alignment_required: empty line tokens")
+
+    pos = 0
+    first_idx: Optional[int] = None
+    last_idx: Optional[int] = None
+    n = len(tokens_words)
+
+    for tok in tokens_line:
+        found = False
+        while pos < n:
+            if tokens_words[pos] == tok:
+                if first_idx is None:
+                    first_idx = pos
+                last_idx = pos
+                pos += 1
+                found = True
+                break
+            pos += 1
+        if not found:
+            raise ValueError(
+                "alignment_required: failed to create text_over item (token not found)"
+            )
+
+    assert first_idx is not None and last_idx is not None
+    return first_idx, last_idx
+
+
+class TextOverBuilder:
+    """Xây dựng text_over bằng thuật toán con trỏ đơn giản (không fallback), phù hợp
+    với cách Gentle tạo words.json.
+
+    Nguồn token (theo Gentle):
+    - Dùng trường `word` của mọi phần tử để tạo chuỗi token toàn cục (word_token_stream)
+      bằng tokenizer nhẹ `_tokens()`; giữ nguyên thứ tự như words.json.
+    - Vẫn giữ thứ tự và số lượng phần tử như words.json; có thể gặp:
+      * case == "success": có `start`/`end`.
+      * case == "not-found-in-audio": không có thời gian.
+    - Lưu ánh xạ: token_index -> chỉ số phần tử gốc trong words.json.
+
+    Cho mỗi dòng transcript:
+    - Tokenize nhẹ theo cùng tinh thần Gentle: lowercase, bỏ punctuation ngoại biên,
+      giữ "'" và "-" khi nằm giữa chữ/số. Nếu dòng rỗng sau chuẩn hoá thì BỎ QUA (không coi là fail).
+    - Tìm start (t0) bằng con trỏ:
+      * base = cursor; thử lần lượt base+0, +1, +2, +3 với token đầu dòng (x = offset khớp).
+      * Nếu không khớp, dịch base theo lô step_k (= 4) và lặp; dừng khi base >= len(stream).
+    - Tìm end (t1):
+      * L = len(line_toks); est_t1 = t0 + (L - x) - 1.
+      * Snap theo thứ tự cố định: est, est-1, est+1, est-2, est+2 (giới hạn trong [t0, n-1]).
+      * Nếu vẫn không có, thử đúng 1 bước lùi (est_t1 - 1). Không fallback subsequence.
+    - Nếu có (t0, t1): tính thời gian và emit item; sau đó cursor = t1 + 1.
+
+    Chính sách thời gian (success-only):
+    - Chỉ lấy thời gian từ phần tử `case == "success"`.
+    - Ánh xạ (t0..t1) -> (w0..w1) theo chỉ số word gốc, rồi tìm success bao-quanh:
+      * w0_success: success đầu tiên tại/ sau w0
+      * w1_success: success cuối cùng tại/ trước w1
+      Nếu thiếu 1 trong 2, coi dòng thất bại.
+
+    Hành vi khi thất bại:
+    - Không dùng fallback subsequence. Không tìm được start/end hoặc không suy được thời gian -> raise.
+    - Thông điệp lỗi khuyến nghị:
+      * "alignment_failed: start_not_found"
+      * "alignment_failed: end_not_found"
+      * "alignment_failed: timing_not_resolvable"
+    - Duration = end(w1_success) - start(w0_success), chặn không âm. Không mở rộng/padding.
+    """
+
+    class SequentialMatchConfig:
+        """Config for pointer-based sequential matching.
+
+        - step_k: primary stride for probing start token positions (e.g., +3)
+        - relax_x: relaxation for expected end index computation (len(line)-x)
+        - end_tolerance: try to snap the last token within +/- this window
+        - max_linear_scan: fallback linear scan distance when step probes miss
+        """
+
+        def __init__(
+            self,
+            *,
+            step_k: int = 4,
+            relax_x: int = 0,
+            end_tolerance: int = 2,
+            max_linear_scan: int = 256,
+        ) -> None:
+            self.step_k = max(1, step_k)
+            self.relax_x = max(0, relax_x)
+            self.end_tolerance = max(0, end_tolerance)
+            self.max_linear_scan = max(1, max_linear_scan)
+
     def __init__(
-        self, *, temp_dir: str, config: Optional[ExpansionConfig] = None
+        self,
+        *,
+        temp_dir: str,
+        config: Optional["TextOverBuilder3.SequentialMatchConfig"] = None,
     ) -> None:
         self._temp_dir = temp_dir
-        self._config = config or ExpansionConfig()
-        # Caches populated per build() call
-        self._success_index_map: Dict[int, int] = {}
-        self._success_token_sets: List[set] = []
+        self._cfg = config or TextOverBuilder.SequentialMatchConfig()
 
     def build(
         self,
@@ -64,827 +207,190 @@ class TextOverBuilder(ITextOverBuilder):
         word_items: List[Dict[str, Any]],
         chunks: List[str],
         text_over_id: Optional[str] = None,
-        media_duration_s: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Build text overlay items from transcript chunks and aligned words.
-
-        Args:
-            word_items: List of word alignment data from speech recognition
-            chunks: List of transcript text chunks to overlay
-            text_over_id: Optional ID for persistence
-            media_duration_s: Optional media duration for end-of-media clamping
-
-        Returns:
-            List of text overlay items with timing and content
-
-        Raises:
-            ValueError: If word_items is empty or no successful words available
-        """
-        if not word_items:
+        if not isinstance(word_items, list) or not word_items:
             raise ValueError("alignment_required: word_items are required")
+        if not isinstance(chunks, list) or not chunks:
+            raise ValueError("alignment_required: chunks are required")
 
-        success_words = filter_successful_words(word_items)
+        success_words = _extract_success_words(word_items)
         if not success_words:
-            raise ValueError("no successful words available for alignment")
+            raise ValueError("alignment_required: no successful words with timings")
 
-        # Build caches for this run
-        try:
-            self._success_index_map = {
-                id(w): idx for idx, w in enumerate(success_words)
-            }
-        except Exception:
-            self._success_index_map = {}
-        try:
-            self._success_token_sets = [
-                (
-                    set(normalize_text(str(w.get("word", ""))))
-                    if isinstance(w, dict)
-                    else set()
-                )
-                for w in success_words
-            ]
-        except Exception:
-            self._success_token_sets = [set() for _ in success_words]
+        # Build global token stream from ALL word_items using tokens of 'word'.
+        # Keep token -> original word index map.
+        word_token_stream: List[str] = []
+        token_to_word_index: List[int] = []
+        for wi, w in enumerate(word_items):
+            toks = _tokens(w.get("word", ""))
+            for tok in toks:
+                word_token_stream.append(tok)
+                token_to_word_index.append(wi)
 
-        text_over_items: List[Dict[str, Any]] = []
-        word_index = 0
+        if not word_token_stream:
+            raise ValueError("alignment_required: no tokens in success words")
 
-        for chunk in chunks:
-            if not chunk.strip():
-                continue
+        results: List[Dict[str, Any]] = []
 
-            item = self._process_chunk(
-                chunk, success_words, word_index, media_duration_s
+        # Maintain a moving pointer over the token stream across lines
+        cursor_token_idx = 0
+        n_tokens_words = len(word_token_stream)
+
+        def _safe_emit(w0_idx: int, w1_idx: int, line_text: str, wc: int) -> None:
+            nonlocal results
+            if w1_idx < w0_idx:
+                w0_idx, w1_idx = w1_idx, w0_idx
+
+            # Find surrounding success items to resolve timing
+            n_words = len(word_items)
+            if not (0 <= w0_idx < n_words and 0 <= w1_idx < n_words):
+                raise ValueError("alignment_failed: timing_not_resolvable")
+
+            # w0_success: first success at or after w0_idx
+            w0_succ: Optional[int] = None
+            for j in range(w0_idx, n_words):
+                wj = word_items[j]
+                if (
+                    wj.get("case") == "success"
+                    and _is_finite_number(wj.get("start"))
+                    and _is_finite_number(wj.get("end"))
+                ):
+                    w0_succ = j
+                    break
+
+            # w1_success: last success at or before w1_idx
+            w1_succ: Optional[int] = None
+            for j in range(min(w1_idx, n_words - 1), -1, -1):
+                wj = word_items[j]
+                if (
+                    wj.get("case") == "success"
+                    and _is_finite_number(wj.get("start"))
+                    and _is_finite_number(wj.get("end"))
+                ):
+                    w1_succ = j
+                    break
+
+            if w0_succ is None or w1_succ is None:
+                raise ValueError("alignment_failed: timing_not_resolvable")
+
+            start = float(word_items[w0_succ]["start"])  # type: ignore[arg-type]
+            end = float(word_items[w1_succ]["end"])  # type: ignore[arg-type]
+            if end < start:
+                end = start
+            results.append(
+                {
+                    "text": line_text,
+                    "start_time": start,
+                    "duration": max(0.0, end - start),
+                    "word_count": wc,
+                }
             )
-            if item:
-                text_over_items.append(item)
-                word_index = self._advance_word_index(
-                    item.get("_matched_group", []), success_words, word_index
-                )
 
-        # Post-pass: normalize total durations against success words + allowance
-        try:
-            self._normalize_total_duration(text_over_items, success_words)
-        except Exception as e:
-            logger.debug(f"normalize_total_duration skipped due to error: {e}")
-
-        # Post-pass: enforce ordering, non-overlap, and correct word_count
-        try:
-            self._postprocess_items(text_over_items)
-        except Exception as e:
-            logger.debug(f"postprocess_items skipped due to error: {e}")
-
-        # Final safety clamp: enforce global window [first_success_start - cap, last_success_end + cap]
-        try:
-            self._final_global_clamp(text_over_items, success_words)
-        except Exception as e:
-            logger.debug(f"final_global_clamp skipped due to error: {e}")
-
-        if text_over_id:
-            self._persist_output(text_over_items, text_over_id)
-
-        return text_over_items
-
-    def _final_global_clamp(
-        self, items: List[Dict[str, Any]], success_words: List[Dict[str, Any]]
-    ) -> None:
-        if not items or not success_words:
-            return
-        first = None
-        last = None
-        for w in success_words:
+        for line in chunks:
             try:
-                if isinstance(w, dict) and "start" in w and "end" in w:
-                    s = float(w["start"])
-                    e = float(w["end"])
-                    if math.isfinite(s) and math.isfinite(e) and e > s:
-                        first = s if first is None else min(first, s)
-                        last = e if last is None else max(last, e)
-            except Exception:
-                continue
-        if first is None or last is None:
-            return
-        cap = self._cap_each_side()
-        min_start = max(0.0, first - cap)
-        # Epsilon-safe right bound to prevent tiny FP overshoot
-        eps = 1e-6
-        max_end = (last + cap) - eps
-        for it in items:
-            try:
-                start = float(it.get("start_time", 0.0))
-                dur = float(it.get("duration", 0.0))
-                end = start + dur
-            except (ValueError, TypeError):
-                continue
-            if start < min_start:
-                start = min_start
-            if end > max_end:
-                end = max_end
-            if end <= start:
-                end = start + self._config.min_duration_s
-            it["start_time"] = start
-            it["duration"] = max(0.0, end - start)
+                line_toks = _tokens(line)
+                if not line_toks:
+                    continue
 
-    def _process_chunk(
-        self,
-        chunk: str,
-        success_words: List[Dict[str, Any]],
-        word_index: int,
-        media_duration_s: Optional[float] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Process a single transcript chunk into a text overlay item."""
-        line_norm = normalize_text(chunk)
-        if not line_norm:
-            return None
-
-        # Find alignment using greedy then flexible matching
-        group = self._find_alignment(line_norm, success_words, word_index)
-        if not group:
-            snippet = (chunk[:80] + "...") if len(chunk) > 80 else chunk
-            raise ValueError(
-                f"alignment_required: failed to create text_over item; "
-                f"chunk='{snippet}' tokens={len(line_norm)}"
-            )
-
-        # Bridge small internal gaps to widen the matched group
-        # IMPORTANT: only bridge with words that belong to this chunk (by normalized token),
-        # to avoid swallowing true neighbors outside the chunk.
-        group = self._extend_group_internal(group, success_words, line_norm)
-
-        # Create base item from matched words
-        item = create_text_over_item(chunk, group)
-        if not item:
-            return None
-
-        # Apply hybrid expansion
-        self._apply_expansion(item, group, success_words, media_duration_s)
-
-        # Store matched group for word index advancement
-        item["_matched_group"] = group
-
-        return item
-
-    def _find_alignment(
-        self,
-        normalized_text: List[str],
-        success_words: List[Dict[str, Any]],
-        word_index: int,
-    ) -> List[Dict[str, Any]]:
-        """Find word alignment using greedy then flexible matching."""
-
-        # Small helpers to avoid duplication
-        def _clamp(a: int, lo: int, hi: int) -> int:
-            return max(lo, min(a, hi))
-
-        def _run_flexible_window(start_idx: int, end_idx: int) -> List[Dict[str, Any]]:
-            """Run flexible match on a clamped [start_idx:end_idx) window."""
-            s = _clamp(int(start_idx), 0, len(success_words))
-            e = _clamp(int(end_idx), s, len(success_words))
-            if e <= s:
-                return []
-            window_items = success_words[s:e]
-            return (
-                find_flexible_match(
-                    normalized_text, window_items, max_lookahead=len(window_items)
-                )
-                or []
-            )
-
-        # Try greedy shift match first
-        group = find_greedy_shift_match(
-            normalized_text,
-            success_words,
-            start_idx=word_index,
-            max_skips_per_side=self._config.max_skips_per_side,
-            similarity_threshold=self._config.similarity_threshold,
-        )
-
-        if group:
-            return group
-
-        # Fallback to flexible partial match on primary window
-        flex_group = _run_flexible_window(
-            word_index, word_index + self._config.lookahead_window
-        )
-
-        if flex_group:
-            return flex_group
-
-        # Backoff: expand window and allow slight look-back in case cursor overshot the true region
-        try:
-            start = int(word_index) - int(self._config.backoff_lookback)
-            end = int(word_index) + int(self._config.backoff_window)
-            backoff_group = _run_flexible_window(start, end)
-            if backoff_group:
-                logger.info(
-                    "[text_over_builder:backoff] used backoff search start=%s end=%s size=%s",
-                    max(0, start),
-                    min(len(success_words), end),
-                    min(len(success_words), max(0, end)) - max(0, start),
-                )
-                return backoff_group
-        except Exception as e:
-            logger.debug(f"backoff search failed: {e}")
-
-        return []
-
-    def _extend_group_internal(
-        self,
-        group: List[Dict[str, Any]],
-        success_words: List[Dict[str, Any]],
-        normalized_chunk_tokens: List[str],
-    ) -> List[Dict[str, Any]]:
-        """Extend a matched group by bridging small internal gaps to adjacent words.
-
-        Heuristic: If the next success word starts within max_internal_gap_s of the
-        current group's end, include it. Repeat until the gap exceeds the threshold
-        or we reach the end. This helps cover short regions where alignment tokens
-        were dropped but audio continues seamlessly.
-        """
-        if not group:
-            return group
-
-        try:
-            token_set = set(normalized_chunk_tokens or [])
-            # Determine current group indices and boundary times
-            left_idx, right_idx = self._find_group_indices(group, success_words)
-            if left_idx is None or right_idx is None:
-                return group
-
-            current_start = min(
-                (w["start"] for w in group if isinstance(w, dict) and "start" in w),
-                default=None,
-            )
-            current_end = max(
-                (w["end"] for w in group if isinstance(w, dict) and "end" in w),
-                default=None,
-            )
-            if current_start is None or current_end is None:
-                return group
-
-            # Directional bridging helper to eliminate duplicate code
-            def _bridge(direction: int) -> None:
-                nonlocal left_idx, right_idx, current_start, current_end
-                if direction > 0:
-                    idx = right_idx + 1
-                    while idx < len(success_words):
-                        w = success_words[idx]
-                        # Skip untimed entries (e.g., not-found-in-audio) instead of stopping
-                        if not (isinstance(w, dict) and "start" in w and "end" in w):
-                            idx += direction
-                            continue
-                        try:
-                            w_start = float(w["start"])
-                            w_end = float(w["end"])
-                        except (ValueError, TypeError):
-                            idx += direction
-                            continue
-                        if not (math.isfinite(w_start) and math.isfinite(w_end)):
-                            idx += direction
-                            continue
-
-                        gap = w_start - float(current_end)
-                        w_tokens_set = (
-                            self._success_token_sets[idx]
-                            if 0 <= idx < len(self._success_token_sets)
-                            else set()
-                        )
-                        belongs = any(t in token_set for t in w_tokens_set)
-                        if gap <= self._config.max_internal_gap_s and belongs:
-                            group.append(w)
-                            current_end = max(current_end, w_end)
-                            right_idx = idx
-                            idx += direction
-                            continue
-                        break
-                else:
-                    idx = left_idx - 1
-                    while idx >= 0:
-                        w = success_words[idx]
-                        # Skip untimed entries (e.g., not-found-in-audio) instead of stopping
-                        if not (isinstance(w, dict) and "start" in w and "end" in w):
-                            idx += direction
-                            continue
-                        try:
-                            w_start = float(w["start"])
-                            w_end = float(w["end"])
-                        except (ValueError, TypeError):
-                            idx += direction
-                            continue
-                        if not (math.isfinite(w_start) and math.isfinite(w_end)):
-                            idx += direction
-                            continue
-
-                        gap = float(current_start) - w_end
-                        w_tokens_set = (
-                            self._success_token_sets[idx]
-                            if 0 <= idx < len(self._success_token_sets)
-                            else set()
-                        )
-                        belongs = any(t in token_set for t in w_tokens_set)
-                        if gap <= self._config.max_internal_gap_s and belongs:
-                            group.insert(0, w)
-                            current_start = min(current_start, w_start)
-                            left_idx = idx
-                            idx += direction
-                            continue
-                        break
-
-            # Bridge to the right and then to the left
-            _bridge(+1)
-            _bridge(-1)
-
-        except Exception as e:
-            logger.debug(f"_extend_group_internal failed: {e}")
-
-        return group
-
-    def _apply_expansion(
-        self,
-        item: Dict[str, Any],
-        group: List[Dict[str, Any]],
-        success_words: List[Dict[str, Any]],
-        media_duration_s: Optional[float] = None,
-    ) -> None:
-        """Apply hybrid expansion to extend overlay timing."""
-        if not group:
-            return
-
-        # Get base timing from matched words
-        base_start, base_end = self._get_base_timing(item, group)
-
-        # Find neighbor boundaries
-        left_idx, right_idx = self._find_group_indices(group, success_words)
-        prev_end, next_start = self._get_neighbor_times(
-            left_idx, right_idx, success_words
-        )
-        # Determine if this group sits at the true extremes of the success_words timeline
-        is_left_extreme = bool(left_idx is not None and left_idx == 0)
-        is_right_extreme = bool(
-            right_idx is not None and right_idx == len(success_words) - 1
-        )
-
-        # Calculate extensions directly using side calculator
-        left_gap = (base_start - prev_end) if prev_end is not None else None
-        right_gap = (next_start - base_end) if next_start is not None else None
-        extend_left = self._calculate_side_extension(
-            left_gap, is_left=True, allow_no_neighbor=is_left_extreme
-        )
-        extend_right = self._calculate_side_extension(
-            right_gap, is_left=False, allow_no_neighbor=is_right_extreme
-        )
-
-        # POLICY: Only bridge to neighbor boundaries for sufficiently long chunks (>=9 words).
-        # For shorter chunks, avoid adding neighbor-gap time (helps keep total durations near word durations).
-        try:
-            word_count = int(item.get("word_count", 0))
-        except Exception:
-            word_count = 0
-
-        if word_count < 9:
-            # If a neighbor exists on a side, disable bridging on that side (keep internal/base timing on that side).
-            if prev_end is not None:
-                extend_left = 0.0
-            if next_start is not None:
-                extend_right = 0.0
-
-        # Apply timing with constraints
-        new_start = max(0.0, base_start - extend_left)
-        new_end = base_end + extend_right
-
-        # Apply media duration clamping if available
-        if media_duration_s is not None:
-            new_end = min(new_end, media_duration_s)
-
-        # Ensure minimum duration when no extensions
-        if extend_left == 0.0 and extend_right == 0.0:
-            new_end = max(new_end, new_start + self._config.min_duration_s)
-        elif new_end <= new_start:
-            new_end = new_start + 0.01
-
-        item["start_time"] = new_start
-        item["duration"] = new_end - new_start
-
-        # Store metadata for normalization
-        item["_base_start"] = float(base_start)
-        item["_base_end"] = float(base_end)
-        item["_ext_left"] = float(max(0.0, base_start - new_start))
-        item["_ext_right"] = float(max(0.0, new_end - base_end))
-        # Sum of actual word durations inside this item
-        try:
-            words_sum = 0.0
-            for w in group:
-                if isinstance(w, dict) and "start" in w and "end" in w:
-                    s = float(w["start"])
-                    e = float(w["end"])
-                    if math.isfinite(s) and math.isfinite(e) and e > s:
-                        words_sum += e - s
-            item["_words_dur_sum"] = float(max(0.0, words_sum))
-        except Exception:
-            item["_words_dur_sum"] = float(max(0.0, item.get("duration", 0.0)))
-
-    def _get_base_timing(
-        self, item: Dict[str, Any], group: List[Dict[str, Any]]
-    ) -> Tuple[float, float]:
-        """Extract base start and end times from matched word group."""
-        try:
-            group_starts = [w["start"] for w in group if "start" in w]
-            group_ends = [w["end"] for w in group if "end" in w]
-
-            if group_starts and group_ends:
-                return min(group_starts), max(group_ends)
-        except (KeyError, TypeError) as e:
-            logger.warning(f"Failed to extract group timing: {e}")
-
-        # Fallback to item timing
-        return item["start_time"], item["start_time"] + item["duration"]
-
-    def _find_group_indices(
-        self, group: List[Dict[str, Any]], success_words: List[Dict[str, Any]]
-    ) -> Tuple[Optional[int], Optional[int]]:
-        """Find the indices of the matched group within success_words."""
-        if not group:
-            return None, None
-
-        group_indices: List[int] = []
-        # Use precomputed identity map if available
-        word_to_index = self._success_index_map or {
-            id(word): idx for idx, word in enumerate(success_words)
-        }
-
-        try:
-            for word in group:
-                # Try identity lookup first (faster)
-                idx_id = word_to_index.get(id(word))
-                if idx_id is not None:
-                    group_indices.append(idx_id)
-                else:
-                    # Fallback to equality comparison
-                    for idx, sw in enumerate(success_words):
-                        if sw == word:
-                            group_indices.append(idx)
+                # 1) Tìm start theo base+0..+3; nếu không thấy, base += step_k và lặp
+                start_tok = line_toks[0]
+                found_start_tok_idx: Optional[int] = None
+                matched_offset: Optional[int] = None  # x in {0,1,2,3}
+                base = cursor_token_idx
+                while base < n_tokens_words and found_start_tok_idx is None:
+                    for o in range(0, 4):
+                        idx = base + o
+                        if idx >= n_tokens_words:
                             break
-                    else:
-                        logger.debug(
-                            f"Word not found in success_words: {word.get('word', 'unknown')}"
-                        )
+                        wt = word_token_stream[idx]
+                        if _approx_token_eq(wt, start_tok):
+                            found_start_tok_idx = idx
+                            matched_offset = o
+                            break
+                    if found_start_tok_idx is None:
+                        base += self._cfg.step_k
 
-            if group_indices:
-                return min(group_indices), max(group_indices)
+                if found_start_tok_idx is None or matched_offset is None:
+                    raise ValueError("alignment_failed: start_not_found")
 
-        except (KeyError, AttributeError) as e:
-            logger.warning(f"Failed to find group indices: {e}")
+                t0_idx = found_start_tok_idx
 
-        return None, None
+                # 2) Ước lượng end theo L - x, rồi snap theo thứ tự cố định
+                L = len(line_toks)
+                x = matched_offset
+                est_t1 = t0_idx + (L - x) - 1
+                est_t1 = min(est_t1, n_tokens_words - 1)
 
-    def _get_neighbor_times(
-        self,
-        left_idx: Optional[int],
-        right_idx: Optional[int],
-        success_words: List[Dict[str, Any]],
-    ) -> Tuple[Optional[float], Optional[float]]:
-        """Get timing of neighboring words."""
-        prev_end = None
-        next_start = None
+                last_tok = line_toks[-1]
+                t1_idx: Optional[int] = None
+                # Snap order based on configurable end_tolerance within bounds [t0_idx, n-1]
+                tol = self._cfg.end_tolerance
+                snap_cands: List[int] = []
+                # Always try est first, then ±1..±tol interleaved
+                snap_cands.append(est_t1)
+                for d in range(1, max(1, tol) + 1):
+                    snap_cands.append(est_t1 - d)
+                    snap_cands.append(est_t1 + d)
+                for cand in snap_cands:
+                    if cand < t0_idx or cand >= n_tokens_words:
+                        continue
+                    wt = word_token_stream[cand]
+                    if _approx_token_eq(wt, last_tok):
+                        t1_idx = cand
+                        break
 
-        try:
-            # Validate indices before accessing
-            if (
-                left_idx is not None
-                and 0 <= left_idx < len(success_words)
-                and left_idx > 0
-            ):
-                prev_w = success_words[left_idx - 1]
-                if isinstance(prev_w, dict) and "end" in prev_w:
-                    val = float(prev_w["end"])
-                    prev_end = val if math.isfinite(val) else None
+                # 2b) Nếu vẫn chưa thấy, thử quét tuyến tính ngắn quanh est_t1 trong giới hạn max_linear_scan
+                if t1_idx is None:
+                    max_scan = self._cfg.max_linear_scan
+                    # Forward scan from est_t1+1
+                    i = est_t1 + 1
+                    steps = 0
+                    while i < n_tokens_words and steps < max_scan and t1_idx is None:
+                        if i >= t0_idx and _approx_token_eq(
+                            word_token_stream[i], last_tok
+                        ):
+                            t1_idx = i
+                            break
+                        i += 1
+                        steps += 1
+                    # Backward scan from est_t1-1 if still not found
+                    if t1_idx is None:
+                        i = max(t0_idx, est_t1 - 1)
+                        steps = 0
+                        while i >= t0_idx and steps < max_scan:
+                            if _approx_token_eq(word_token_stream[i], last_tok):
+                                t1_idx = i
+                                break
+                            i -= 1
+                            steps += 1
 
-            if right_idx is not None and 0 <= right_idx < len(success_words) - 1:
-                next_w = success_words[right_idx + 1]
-                if isinstance(next_w, dict) and "start" in next_w:
-                    val = float(next_w["start"])
-                    next_start = val if math.isfinite(val) else None
+                if t1_idx is None:
+                    raise ValueError("alignment_failed: end_not_found")
 
-        except (IndexError, KeyError, ValueError, TypeError) as e:
-            logger.warning(f"Failed to get neighbor times: {e}")
+                # 3) Map token indices to word indices and emit
+                w0_abs = token_to_word_index[t0_idx]
+                w1_abs = token_to_word_index[t1_idx]
+                _safe_emit(w0_abs, w1_abs, line, len(line_toks))
 
-        return prev_end, next_start
-
-    def _calculate_side_extension(
-        self, gap: Optional[float], is_left: bool, allow_no_neighbor: bool
-    ) -> float:
-        """Calculate extension for one side based on gap and configuration."""
-        # Marking as used to satisfy linters; current logic is symmetric and does not need these flags.
-        _ = is_left
-        _ = allow_no_neighbor
-        if gap is None:
-            # No neighbor timing available (corrupted/missing) → treat as absent neighbor and apply no-neighbor padding
-            return max(0.0, self._config.max_expand_s + self._config.pad_s)
-
-        # Validate gap is a valid number
-        try:
-            gap = float(gap)
-        except (ValueError, TypeError):
-            logger.warning(f"Invalid gap value: {gap}, treating as no extension")
-            return 0.0
-
-        if gap <= 0:
-            # Overlapping or touching: no extension
-            return 0.0
-
-        if gap > self._config.max_gap_s:
-            # Gap too large: no bridging
-            return 0.0
-
-        # Small gap: extend up to available space, capped by standard max_expand
-        return min(self._config.max_expand_s, gap)
-
-    def _advance_word_index(
-        self,
-        group: List[Dict[str, Any]],
-        success_words: List[Dict[str, Any]],
-        current_index: int,
-    ) -> int:
-        """Advance word index based on last matched item position."""
-        if not group:
-            return current_index
-
-        try:
-            # Prefer identity lookups via cache; fallback to equality scan
-            indices: List[int] = []
-            for item in group:
-                idx_id = (
-                    self._success_index_map.get(id(item))
-                    if self._success_index_map
-                    else None
-                )
-                if idx_id is not None:
-                    indices.append(idx_id)
+                # 4) Advance cursor to token after t1
+                cursor_token_idx = min(n_tokens_words, t1_idx + 1)
+            except ValueError as ve:
+                msg = str(ve)
+                if msg.startswith("alignment_failed"):
+                    logger.warning("TextOverBuilder3: %s for line: %s", msg, line)
                     continue
-                # Fallback path (should be rare)
-                try:
-                    idx_fallback = success_words.index(item)
-                    indices.append(idx_fallback)
-                except ValueError:
-                    continue
-            last_global_idx = max(indices, default=current_index - 1)
-            return max(current_index, last_global_idx + 1)
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Failed to advance word index: {e}")
-            return current_index
+                raise
 
-    def _normalize_total_duration(
-        self, items: List[Dict[str, Any]], success_words: List[Dict[str, Any]]
-    ) -> None:
-        """Trim added extensions if total overlay duration exceeds budget.
-
-        Budget = sum(success word durations) + 2 * (max_expand_s + pad_s)
-        Only trims the extension portion (keeps base word coverage intact),
-        proportionally across items based on how much extension each has.
-        """
-        if not items:
-            return
-
-        # Compute success duration total and global bounds
-        success_total = 0.0
-        global_first_start = None
-        global_last_end = None
-        for w in success_words:
-            try:
-                if isinstance(w, dict) and "start" in w and "end" in w:
-                    s = float(w["start"])
-                    e = float(w["end"])
-                    if math.isfinite(s) and math.isfinite(e) and e > s:
-                        success_total += e - s
-                        global_first_start = (
-                            s
-                            if global_first_start is None
-                            else min(global_first_start, s)
-                        )
-                        global_last_end = (
-                            e if global_last_end is None else max(global_last_end, e)
-                        )
-            except Exception:
-                continue
-
-        cap_each_side = self._cap_each_side()
-        budget = success_total + 2 * cap_each_side
-
-        def snap_to_base(it: Dict[str, Any]) -> None:
-            start = float(it.get("start_time", 0.0))
-            end = start + float(it.get("duration", 0.0))
-            base_start = float(it.get("_base_start", start))
-            base_end = float(it.get("_base_end", end))
-            new_start = max(start, base_start)
-            new_end = min(end, base_end)
-            if new_end <= new_start:
-                new_end = new_start + self._config.min_duration_s
-            it["start_time"] = new_start
-            it["duration"] = max(0.0, new_end - new_start)
-
-        def cap_extreme_left(it: Dict[str, Any], cap: float) -> None:
-            start = float(it.get("start_time", 0.0))
-            end = start + float(it.get("duration", 0.0))
-            # Enforce start_time >= global_first_start - cap
-            base_start_global = (
-                float(global_first_start) if global_first_start is not None else start
+        # Persist if requested
+        if text_over_id:
+            out_dir = Path(self._temp_dir) / text_over_id
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = out_dir / "text_over.json"
+            out_path.write_text(
+                json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            min_allowed_start = max(0.0, base_start_global - cap)
-            new_start = max(start, min_allowed_start)
-            if new_start > start:
-                it["start_time"] = new_start
-                it["duration"] = max(0.0, end - new_start)
-
-        def cap_extreme_right(it: Dict[str, Any], cap: float) -> None:
-            start = float(it.get("start_time", 0.0))
-            end = start + float(it.get("duration", 0.0))
-            # Enforce end_time <= global_last_end + cap
-            base_end_global = (
-                float(global_last_end) if global_last_end is not None else end
-            )
-            # Epsilon-safe right bound to avoid minor FP overshoot
-            eps = 1e-6
-            max_allowed_end = (base_end_global + cap) - eps
-            new_end = min(end, max_allowed_end)
-            if new_end < end:
-                it["duration"] = max(0.0, new_end - start)
-
-        # Always cap each item to global timeline window first, then also cap extremes
-        if items:
-            # Per-item clamp to [global_first_start - cap, global_last_end + cap]
-            min_window_start = (
-                max(0.0, float(global_first_start) - cap_each_side)
-                if global_first_start is not None
-                else 0.0
-            )
-            # Epsilon-safe right bound
-            eps = 1e-6
-            max_window_end = (
-                (float(global_last_end) + cap_each_side - eps)
-                if global_last_end is not None
-                else None
-            )
-            for it in items:
-                try:
-                    start = float(it.get("start_time", 0.0))
-                    dur = float(it.get("duration", 0.0))
-                    end = start + dur
-                except (ValueError, TypeError):
-                    continue
-                # Left clamp
-                if start < min_window_start:
-                    start = min_window_start
-                # Right clamp
-                if max_window_end is not None and end > max_window_end:
-                    end = max_window_end
-                if end <= start:
-                    end = start + self._config.min_duration_s
-                it["start_time"] = start
-                it["duration"] = max(0.0, end - start)
-
-            # Additionally, cap extremes for idempotency (no-ops if already within window)
-            cap_extreme_left(items[0], cap_each_side)
-            cap_extreme_right(items[-1], cap_each_side)
-
-        # 1) If over budget after extreme capping, remove all extensions on interior items
-        current_total = sum(float(it.get("duration", 0.0)) for it in items)
-        excess = current_total - budget
-        if excess <= 1e-6:
-            return
-
-        if len(items) > 2:
-            for it in items[1:-1]:
-                snap_to_base(it)
-
-        # 2) Re-apply extreme capping after snapping interiors (idempotent safeguard)
-        if items:
-            cap_extreme_left(items[0], cap_each_side)
-            cap_extreme_right(items[-1], cap_each_side)
-
-        # 3) If still over budget, trim from extremes evenly while respecting min durations
-        def total_duration() -> float:
-            return sum(float(it.get("duration", 0.0)) for it in items)
-
-        remaining_excess = total_duration() - budget
-        if remaining_excess <= 1e-6:
-            return
-
-        # Trim loop (bounded iterations)
-        for _ in range(10):
-            if remaining_excess <= 1e-6:
-                break
-            # Trim half from left, half from right
-            take = remaining_excess / 2.0
-
-            # Left
-            if items:
-                it = items[0]
-                start = float(it.get("start_time", 0.0))
-                dur = float(it.get("duration", 0.0))
-                max_move = dur - self._config.min_duration_s
-                move = min(take, max(0.0, max_move))
-                it["start_time"] = start + move
-                it["duration"] = max(self._config.min_duration_s, dur - move)
-
-            # Right
-            if items:
-                it = items[-1]
-                start = float(it.get("start_time", 0.0))
-                dur = float(it.get("duration", 0.0))
-                max_move = dur - self._config.min_duration_s
-                move = min(take, max(0.0, max_move))
-                it["duration"] = max(self._config.min_duration_s, dur - move)
-
-            remaining_excess = total_duration() - budget
-
-    def _postprocess_items(self, items: List[Dict[str, Any]]) -> None:
-        """Preserve order, remove overlaps, and normalize word_count.
-
-        - Preserve the existing list order (transcript order)
-        - Enforce non-overlap by clamping each start_time >= previous end
-        - Ensure minimum duration for readability
-        - Recompute word_count as number of normalized tokens from the text
-        """
-        if not items:
-            return
-
-        # Enforce non-overlap and min duration
-        prev_end = None
-        for it in items:
-            try:
-                start = float(it.get("start_time", 0.0))
-                dur = float(it.get("duration", 0.0))
-            except (ValueError, TypeError):
-                start = (
-                    float(it.get("start_time", 0.0))
-                    if isinstance(it.get("start_time"), (int, float))
-                    else 0.0
-                )
-                dur = (
-                    float(it.get("duration", 0.0))
-                    if isinstance(it.get("duration"), (int, float))
-                    else 0.0
-                )
-
-            if prev_end is not None and start < prev_end:
-                # Shift start to prev_end to remove overlap
-                start = prev_end
-
-            # Ensure minimum duration
-            dur = max(dur, self._config.min_duration_s)
-
-            it["start_time"] = max(0.0, start)
-            it["duration"] = max(self._config.min_duration_s, dur)
-
-            prev_end = it["start_time"] + it["duration"]
-
-        # Recompute word_count from normalized text tokens for consistency
-        for it in items:
-            try:
-                text = str(it.get("text", ""))
-                it["word_count"] = len(normalize_text(text))
-            except Exception:
-                # Leave existing word_count if normalization fails
-                pass
-
-        # Enforce reasonable duration for multi-word lines (>=4 tokens) if configured
-        min_req = float(getattr(self._config, "min_multiword_duration_s", 0.0) or 0.0)
-        if min_req > 0:
-            for it in items:
-                try:
-                    tokens = int(it.get("word_count", 0))
-                    if tokens >= 4:
-                        dur = float(it.get("duration", 0.0))
-                        if dur < min_req:
-                            it["duration"] = min_req
-                except Exception:
-                    continue
-
-    def _cap_each_side(self) -> float:
-        """Helper: maximum allowed combined extension on a single extreme side."""
-        return max(0.0, self._config.max_expand_s + self._config.pad_s)
-
-    def _persist_output(
-        self, text_over_items: List[Dict[str, Any]], text_over_id: str
-    ) -> None:
-        """Persist text overlay items to JSON file."""
-        try:
-            # Remove internal metadata before persistence
-            clean_items = [
-                {k: v for k, v in item.items() if not k.startswith("_")}
-                for item in text_over_items
-            ]
-
-            target_dir = Path(self._temp_dir) / text_over_id
-            target_dir.mkdir(parents=True, exist_ok=True)
-            out_path = target_dir / "text_over.json"
-
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(clean_items, f, ensure_ascii=False, indent=2)
-
             logger.info(
-                f"Persisted {len(clean_items)} text overlay items to {out_path}"
+                f"TextOverBuilder3:Persisted {len(results)} text overlay items to {out_path}"
             )
-        except Exception as e:
-            logger.error(f"Failed to persist text overlay items: {e}")
-            # Do not fail pipeline on persistence errors
+
+        return results

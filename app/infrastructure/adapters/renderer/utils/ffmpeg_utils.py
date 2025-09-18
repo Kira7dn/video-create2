@@ -1,20 +1,69 @@
-"""
-Video processing utilities for video creation.
+"""Renderer-scoped FFmpeg utilities (localized implementations).
 
-This module provides functions for video processing tasks such as concatenation,
-transitions, and audio mixing using FFmpeg.
+This module centralizes FFmpeg-related helpers for the renderer adapter layer
+and provides self-contained implementations so we do not depend on
+project-level `utils.*` modules. It preserves the previous behaviors and APIs.
 """
 
+from __future__ import annotations
 import json
 import os
 import re
 import math
 import shutil
 from typing import List, Optional, Dict, Any
+import subprocess
+import logging
 
 from app.core.config import settings
 
-from utils.subprocess_utils import safe_subprocess_run, SubprocessError
+
+logger = logging.getLogger(__name__)
+
+
+class SubprocessError(Exception):
+    """
+    Custom exception for subprocess errors.
+
+    This exception is raised when a subprocess command fails to execute properly.
+    It provides a descriptive error message about the failure.
+    """
+
+    def __init__(self, message, command=None, returncode=None, stderr=None):
+        """
+        Initialize the exception with error details.
+
+        Args:
+            message: Primary error message
+            command: Optional command that was executed (list or str)
+            returncode: Optional exit code from the process
+            stderr: Optional error output from the process
+        """
+        self.message = message
+        self.command = command
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(self.message)
+
+    def __str__(self):
+        """Format the error message with available details."""
+        parts = [self.message]
+        if self.command:
+            cmd_str = (
+                " ".join(self.command)
+                if isinstance(self.command, list)
+                else self.command
+            )
+            parts.append(f"Command: {cmd_str}")
+        if self.returncode is not None:
+            parts.append(f"Exit code: {self.returncode}")
+        if self.stderr:
+            stderr = str(self.stderr)
+            if len(stderr) > 500:  # Limit stderr length
+                stderr = stderr[:500] + "... [truncated]"
+            parts.append(f"Error output: {stderr}")
+
+        return "\n".join(parts)
 
 
 class VideoProcessingError(SubprocessError):
@@ -28,7 +77,7 @@ def ffmpeg_concat_videos(
     background_music: Optional[dict] = None,
     logger: Optional[Any] = None,
     bgm_volume: float = 0.2,
-) -> None:
+) -> str:
     """
     Concatenate video segments with per-pair transitions, then overlay
     background music (with start_delay, end_delay) as in input_sample.json.
@@ -138,7 +187,9 @@ def ffmpeg_concat_videos(
             if auto_volume:
                 logger.info("🔈 Auto-volume: loudnorm + ducking (enabled)")
             else:
-                logger.info("🔇 Auto-volume disabled: no loudnorm, no ducking; mixing BGM at fixed volume")
+                logger.info(
+                    "🔇 Auto-volume disabled: no loudnorm, no ducking; mixing BGM at fixed volume"
+                )
 
         # Always pre-normalize BGM using EBU R128 loudness (two-pass when possible)
         # Targets now aligned with renderer segment settings
@@ -224,7 +275,9 @@ def ffmpeg_concat_videos(
                 bgm_path = normalized_bgm_path
             except Exception as e:
                 if logger:
-                    logger.warning(f"Loudnorm normalization failed, continue without: {e}")
+                    logger.warning(
+                        f"Loudnorm normalization failed, continue without: {e}"
+                    )
                 normalized_bgm_path = None
 
         # Mix level for BGM after normalization (no auto detection needed)
@@ -257,7 +310,7 @@ def ffmpeg_concat_videos(
             if os.path.exists(output_path):
                 raise VideoProcessingError(f"Output file already exists: {output_path}")
             shutil.copy2(temp_path, output_path)
-            return
+            return output_path
 
         filter_parts = []
         if start_delay > 0:
@@ -376,5 +429,66 @@ def ffmpeg_concat_videos(
             output_path,
         ]
         if logger:
-            logger.info(f"Re-encode to normalize A/V after concat: {' '.join(reenc_cmd)}")
+            logger.info(
+                f"Re-encode to normalize A/V after concat: {' '.join(reenc_cmd)}"
+            )
         safe_subprocess_run(reenc_cmd, "Normalize A/V after concat", logger)
+
+    return output_path
+
+
+def safe_subprocess_run(
+    cmd, operation_name="FFmpeg operation", custom_logger: Optional[Any] = None
+):
+    """
+    Safely run subprocess with proper error handling
+
+    Args:
+        cmd: Command to run as list of strings
+        operation_name: Descriptive name for the operation (for logging)
+        custom_logger: Optional logger to use instead of default
+
+    Returns:
+        subprocess.CompletedProcess result
+
+    Raises:
+        SubprocessError: If subprocess fails or FFmpeg not found
+    """
+    active_logger = custom_logger or logger
+
+    try:
+        if active_logger:
+            active_logger.debug(
+                "Running %s: %s", operation_name, " ".join(str(x) for x in cmd)
+            )
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+        )
+        return result
+    except subprocess.CalledProcessError as e:
+        error_msg = f"{operation_name} failed with return code {e.returncode}"
+
+        # Windows-specific error code handling
+        if e.returncode == -2147024896:  # 0x80004005 as signed int
+            error_msg += " (Windows Error 0x80004005 - Access Denied or File in Use)"
+        elif e.returncode == 3131621040:  # Another form of 0x80004005
+            error_msg += " (Windows Error - Possible file access or permission issue)"
+
+        if e.stderr:
+            error_msg += f"\nFFmpeg stderr: {e.stderr}"
+        if e.stdout:
+            error_msg += f"\nFFmpeg stdout: {e.stdout}"
+        if active_logger:
+            active_logger.error(error_msg)
+        raise SubprocessError(error_msg, cmd, e.returncode, e.stderr) from e
+    except (OSError, PermissionError) as e:
+        if isinstance(e, FileNotFoundError):
+            error_msg = (
+                f"{operation_name} failed: FFmpeg not found. "
+                "Please ensure FFmpeg is installed and in PATH."
+            )
+        else:
+            error_msg = f"{operation_name} failed with OS/Permission error: {e}"
+        if active_logger:
+            active_logger.error(error_msg)
+        raise SubprocessError(error_msg, cmd) from e

@@ -14,17 +14,21 @@ logger = logging.getLogger(__name__)
 class ConcatenateVideoStep(BaseStep):
     name = "concatenate_video"
     required_keys = ["segment_clips"]
+
     def __init__(self, renderer: IVideoRenderer):
         self.renderer = renderer
 
-    async def run(self, context: PipelineContext) -> None:  # type: ignore[override]
+    async def run(self, context: PipelineContext) -> None:
         clips = context.get("segment_clips") or []
         if not isinstance(clips, list):
             raise ValueError("segment_clips must be a list")
 
         # Normalize and validate clip paths
-        clip_paths = [c.get("path") if isinstance(c, dict) else c for c in clips]
-        clip_paths = [p for p in clip_paths if isinstance(p, str) and p]
+        clip_paths = [
+            clip_item.get("path") if isinstance(clip_item, dict) else clip_item
+            for clip_item in clips
+        ]
+        clip_paths = [path for path in clip_paths if isinstance(path, str) and path]
         if not clip_paths:
             raise ProcessingError("No clip paths provided for concatenation")
 
@@ -39,28 +43,15 @@ class ConcatenateVideoStep(BaseStep):
         output_path = os.path.join("data", "output", filename)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        # Optional transition policy (e.g., "fade", "none"), passed through to renderer
-        transition = context.get("concat_transition")
-        # Optional background music downloaded earlier in pipeline (dict with local_path, start_delay, end_delay, ...)
-        # NOTE: Auto-volume (loudnorm/ducking) is controlled globally via settings, not via background_music.
         background_music = context.get("background_music")
 
         logger.info("Concatenating %d clips -> %s", len(clip_paths), output_path)
-        supports_bgm = bool(getattr(self.renderer, "SUPPORTS_BACKGROUND_MUSIC", False))
-        if supports_bgm and background_music:
-            # Pass through background_music as-is; auto-volume behavior decided by settings
-            await self.renderer.concat_clips(
-                clip_paths,
-                output_path=output_path,
-                transition=transition,
-                background_music=background_music,
-            )
-        else:
-            await self.renderer.concat_clips(
-                clip_paths,
-                output_path=output_path,
-                transition=transition,
-            )
+
+        output_path = await self.renderer.concat_clips(
+            clip_paths,
+            output_path=output_path,
+            background_music=background_music,
+        )
 
         # Verify output exists
         if not os.path.exists(output_path):

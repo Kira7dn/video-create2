@@ -13,7 +13,7 @@ from app.infrastructure.adapters import (
     FFmpegMediaProbe,
     ImageProcessor,
     LLMTranscriptSplitter,
-    TextOverBuilder3,
+    TextOverBuilder,
 )
 from app.core.config import settings
 
@@ -42,5 +42,5 @@ def get_video_adapter_bundle(*, temp_dir: str | None = None) -> IVideoPipelineAd
         media_probe=FFmpegMediaProbe(),
         image_processor=ImageProcessor(temp_dir=work_dir),
         splitter=LLMTranscriptSplitter(temp_dir=work_dir),
-        text_over_builder=TextOverBuilder3(temp_dir=work_dir),
+        text_over_builder=TextOverBuilder(temp_dir=work_dir),
     )
