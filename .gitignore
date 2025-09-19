@@ -77,11 +77,12 @@ temp/
 *.sw?
 
 # Test files and outputs
-test/
-test_output/
-*_test.py
-test_*.py
-*_test_*.py
+test/temp/
+test/test_output/
+test/source/
+# *_test.py
+# test_*.py
+# *_test_*.py
 result/
 *.mp4
 *.mp3

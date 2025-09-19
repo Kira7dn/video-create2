@@ -23,11 +23,6 @@ class CreateSegmentClipsStep(BaseStep):
         fit_mode: str,
     ) -> dict:
         seg = segment or {}
-        base_duration = float(
-            seg.get(
-                "duration", getattr(settings, "video_default_segment_duration", 4.0)
-            )
-        )
         input_type, input_media, original_duration, voice_path = (
             await self._determine_input_and_duration(seg)
         )
@@ -250,7 +245,9 @@ class CreateSegmentClipsStep(BaseStep):
 
         return transformations, total_duration, delay
 
-    def _build_text_overlays(self, seg: dict, total_duration: float, delay: float) -> list[dict]:
+    def _build_text_overlays(
+        self, seg: dict, total_duration: float, delay: float
+    ) -> list[dict]:
         text_overlays: list[dict] = []
         text_overs = seg.get("text_over", None)
         if text_overs:
