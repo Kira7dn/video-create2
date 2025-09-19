@@ -123,12 +123,16 @@ class CreateSegmentClipsStep(BaseStep):
             if voice_path:
                 try:
                     voice_len = await self.renderer.duration(voice_path)
-                    # Include start_delay so fade-out starts after delayed voice end
+                    # Include start_delay and end_delay for image-based segment duration
                     start_delay_for_len = float(
                         (voice_over or {}).get("start_delay", 0) or 0
                     )
+                    end_delay_for_len = float(
+                        (voice_over or {}).get("end_delay", 0) or 0
+                    )
                     original_duration = max(
-                        base_duration, float(voice_len) + start_delay_for_len
+                        base_duration,
+                        float(voice_len) + start_delay_for_len + end_delay_for_len,
                     )
                 except Exception:
                     original_duration = base_duration
@@ -180,6 +184,10 @@ class CreateSegmentClipsStep(BaseStep):
             else 0
         )
 
+        # Voice delays
+        start_delay_val = float((seg.get("voice_over") or {}).get("start_delay", 0) or 0)
+        end_delay_val = float((seg.get("voice_over") or {}).get("end_delay", 0) or 0)
+
         if fade_in_duration > 0:
             transformations.append(
                 {
@@ -195,17 +203,24 @@ class CreateSegmentClipsStep(BaseStep):
                     "type": "transition",
                     "target": "audio",
                     "direction": "in",
+                    # Audio fade-in starts at 0.0; actual delay is handled by explicit audio_delay transform
                     "start": 0.0,
                     "duration": float(fade_in_duration),
                 }
             )
 
+        # Compute core content duration (excluding fades)
+        # For video: core = start_delay + media + end_delay
+        # For image: original_duration already accounts for base vs voice_len+start+end, so core = original_duration
+        core_duration = (
+            float(start_delay_val + original_duration + end_delay_val)
+            if input_type == "video"
+            else float(original_duration)
+        )
+
         if fade_out_duration > 0:
-            fade_out_start = (
-                max(0.0, original_duration - fade_out_duration)
-                if input_type == "video"
-                else fade_in_duration + original_duration
-            )
+            # Out transition starts after: transition_in -> start_delay -> main -> end_delay
+            fade_out_start = float(fade_in_duration + core_duration)
             transformations.append(
                 {
                     "type": "transition",
@@ -225,14 +240,12 @@ class CreateSegmentClipsStep(BaseStep):
                 }
             )
 
-        total_duration = (
-            original_duration
-            if input_type == "video"
-            else fade_in_duration + original_duration + fade_out_duration
-        )
-        # Delay components
-        start_delay = float(voice_over.get("start_delay", 0) or 0)
-        delay = fade_in_duration + start_delay
+        # Total segment duration per requested rule
+        total_duration = float(fade_in_duration + core_duration + fade_out_duration)
+
+        # Delay components: transition_in -> delay_start, used for audio_delay and text overlay shift
+        start_delay = float(start_delay_val)
+        delay = float(fade_in_duration + start_delay)
 
         # If audio has a configured delay, emit an explicit audio delay transform (ms)
         if delay > 0:

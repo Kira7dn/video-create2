@@ -209,6 +209,10 @@ class FFMpegVideoRenderer(IVideoRenderer, TextProcessingMixin, EffectsMixin):
             # Process effects with priority ordering
             ordered_ops = sorted(ops, key=lambda op: op.get("priority", 0))
             video_filters, audio_filters = self._process_effects(ordered_ops)
+            # Stabilize audio PTS to start at 0 and allow resampling jitter correction
+            if audio_filters is None:
+                audio_filters = []
+            audio_filters.append("aresample=async=1:first_pts=0")
 
             # Add ASS subtitles if there are text events
             ass_path = None

@@ -94,7 +94,8 @@ def translate_specification_to_plan(
         def _build_audio_delay(_: dict) -> None:
             ms = int(_.get("milliseconds", 0) or 0)
             if ms > 0:
-                ops.append({"op": "audio_delay", "milliseconds": ms})
+                # Ensure audio delay is applied BEFORE fade/transition by giving higher priority (lower value)
+                ops.append({"op": "audio_delay", "milliseconds": ms, "priority": -100})
 
         def _build_transition(t: dict) -> None:
             target = "video" if t.get("target") == "visual" else "audio"
@@ -102,7 +103,8 @@ def translate_specification_to_plan(
             start = float(t.get("start", 0))
             dur = float(t.get("duration", 0))
             fade_spec = {direction: {"start": start, "duration": dur}}
-            ops.append({"op": "fade", "target": target, **fade_spec})
+            # Keep default priority (0) so fades come AFTER delays
+            ops.append({"op": "fade", "target": target, **fade_spec, "priority": 0})
 
         def _build_text_overlay(t: dict) -> None:
             content = t.get("content", "")

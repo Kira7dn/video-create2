@@ -113,8 +113,9 @@ async def test_video_segment_duration_equals_media_duration():
     assert len(fake.captured_specs) == 1
     spec = fake.captured_specs[0]
     assert spec["primary_source"] == "/tmp/clip.mp4"
-    # For video, duration should equal media duration
-    assert pytest.approx(spec["duration"], rel=1e-6) == 7.25
+    # New logic: total duration = transition_in + start_delay + media + end_delay + transition_out
+    # Here start_delay=end_delay=0, so total = 1.2 + 7.25 + 1.0 = 9.45
+    assert pytest.approx(spec["duration"], rel=1e-6) == 9.45
 
 
 @pytest.mark.asyncio
@@ -163,9 +164,10 @@ async def test_video_duration_error_falls_back_to_base():
     ctx.set("segments", [segment])
     await step(ctx)
 
-    # For video, duration should equal original_duration which falls back to base (4.5)
+    # New logic: total duration = transition_in + start_delay + base + end_delay + transition_out
+    # With base=4.5, start/end delay=0, fades 1.0/1.0 => total = 1.0 + 4.5 + 1.0 = 6.5
     spec = fake.captured_specs[0]
-    assert pytest.approx(spec["duration"], rel=1e-6) == 4.5
+    assert pytest.approx(spec["duration"], rel=1e-6) == 6.5
 
 
 @pytest.mark.asyncio
@@ -269,3 +271,101 @@ async def test_emits_audio_delay_when_start_delay_set():
     ]
     assert len(audio_delays) == 1
     assert audio_delays[0]["milliseconds"] == 800
+
+
+@pytest.mark.asyncio
+async def test_video_segment_with_start_end_delay_and_fades_duration():
+    fake = FakeRenderer({"/tmp/clip.mp4": 2.0})
+    step = CreateSegmentClipsStep(renderer=fake)  # type: ignore[arg-type]
+
+    segment = {
+        "id": "sv1",
+        "video": {"local_path": "/tmp/clip.mp4"},
+        "voice_over": {"start_delay": 0.3, "end_delay": 0.4},
+        "transition_in": {"duration": 0.5},
+        "transition_out": {"duration": 0.6},
+    }
+
+    ctx = PipelineContext(input={})
+    ctx.set("segments", [segment])
+    await step(ctx)
+
+    spec = fake.captured_specs[0]
+    # total = fade_in + start_delay + media + end_delay + fade_out = 0.5 + 0.3 + 2.0 + 0.4 + 0.6 = 3.8
+    assert pytest.approx(spec["duration"], rel=1e-6) == 3.8
+
+
+@pytest.mark.asyncio
+async def test_video_audio_delay_equals_fadein_plus_start_delay():
+    fake = FakeRenderer({"/tmp/clip.mp4": 1.0})
+    step = CreateSegmentClipsStep(renderer=fake)  # type: ignore[arg-type]
+
+    segment = {
+        "id": "sv2",
+        "video": {"local_path": "/tmp/clip.mp4"},
+        "voice_over": {"start_delay": 0.3},
+        "transition_in": {"duration": 0.5},
+        "transition_out": {"duration": 0.1},
+    }
+
+    ctx = PipelineContext(input={})
+    ctx.set("segments", [segment])
+    await step(ctx)
+
+    spec = fake.captured_specs[0]
+    audio_delays = [t for t in spec["transformations"] if t.get("type") == "audio_delay"]
+    assert len(audio_delays) == 1
+    # delay_ms = (fade_in + start_delay) * 1000 = (0.5 + 0.3) * 1000 = 800
+    assert audio_delays[0]["milliseconds"] == 800
+
+
+@pytest.mark.asyncio
+async def test_image_segment_with_start_end_delay_and_fades_duration():
+    # voice 1.2s, start=0.3, end=0.4 => original_duration = max(1.0, 1.2+0.3+0.4=1.9)=1.9
+    # total = fade_in(0.2) + 1.9 + fade_out(0.3) = 2.4
+    fake = FakeRenderer({"/tmp/voice.wav": 1.2})
+    step = CreateSegmentClipsStep(renderer=fake)  # type: ignore[arg-type]
+
+    segment = {
+        "id": "si1",
+        "duration": 1.0,
+        "image": {"local_path": "/tmp/bg.jpg"},
+        "voice_over": {"local_path": "/tmp/voice.wav", "start_delay": 0.3, "end_delay": 0.4},
+        "transition_in": {"duration": 0.2},
+        "transition_out": {"duration": 0.3},
+    }
+
+    ctx = PipelineContext(input={})
+    ctx.set("segments", [segment])
+    await step(ctx)
+
+    spec = fake.captured_specs[0]
+    assert pytest.approx(spec["duration"], rel=1e-6) == 2.4
+
+
+@pytest.mark.asyncio
+async def test_video_transition_out_starts_after_core():
+    # media=2.0, start=0.3, end=0.4, fade_in=0.5, fade_out=0.6
+    # core = start + media + end = 0.3 + 2.0 + 0.4 = 2.7
+    # fade_out_start = fade_in + core = 0.5 + 2.7 = 3.2
+    fake = FakeRenderer({"/tmp/clip.mp4": 2.0})
+    step = CreateSegmentClipsStep(renderer=fake)  # type: ignore[arg-type]
+
+    segment = {
+        "id": "sv3",
+        "video": {"local_path": "/tmp/clip.mp4"},
+        "voice_over": {"start_delay": 0.3, "end_delay": 0.4},
+        "transition_in": {"duration": 0.5},
+        "transition_out": {"duration": 0.6},
+    }
+
+    ctx = PipelineContext(input={})
+    ctx.set("segments", [segment])
+    await step(ctx)
+
+    spec = fake.captured_specs[0]
+    trans_out = [t for t in spec["transformations"] if t.get("type") == "transition" and t.get("direction") == "out"]
+    assert len(trans_out) == 2  # visual + audio
+    starts = sorted(set(float(t.get("start", -1)) for t in trans_out))
+    assert len(starts) == 1
+    assert pytest.approx(starts[0], rel=1e-6) == 3.2

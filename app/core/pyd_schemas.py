@@ -35,9 +35,7 @@ class Transition(BaseModel):
 
 
 class BackgroundMusic(Media):
-    volume: Optional[float] = None
-    fade_in: Optional[float] = None
-    fade_out: Optional[float] = None
+    url: str = None
 
 
 class Segment(BaseModel):

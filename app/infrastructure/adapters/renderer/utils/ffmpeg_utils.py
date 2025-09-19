@@ -180,7 +180,8 @@ def ffmpeg_concat_videos(
     bgm_processed = False
     if background_music and background_music.get("local_path"):
         bgm_path = background_music.get("local_path")
-        start_delay = float(background_music.get("start_delay", 0) or 0)
+        # start_delay removed from schema/behavior: always start BGM at t=0
+        start_delay = 0.0
         video_duration = get_duration(temp_path)
         auto_volume = bool(getattr(settings, "audio_auto_volume_enabled", True))
         if logger:
@@ -285,18 +286,24 @@ def ffmpeg_concat_videos(
             bgm_volume_factor = float(background_music.get("bgm_volume", bgm_volume))
         except (TypeError, ValueError):
             bgm_volume_factor = bgm_volume
-        # Prepare filter for bgm: delay, trim, volume
-        # Calculate actual BGM play duration considering both start_delay and end_delay
-        end_delay = float(background_music.get("end_delay", 0) or 0)
-        bgm_start_time = start_delay
-        bgm_end_time = max(0, video_duration - end_delay)
+        # Prepare filter for bgm: trim to video duration, volume. BGM should cover the entire video from t=0
+        bgm_start_time = 0.0
+        bgm_end_time = max(0, video_duration)
         bgm_play_duration = max(0, bgm_end_time - bgm_start_time)
+
+        # Tail fade configuration (natural fade at the end of video)
+        tail_fade = 0.0
+        try:
+            tail_fade = float(getattr(settings, "audio_bgm_tail_fade", 1.5))
+        except Exception:
+            tail_fade = 1.5
 
         if logger:
             logger.info(
                 f"🎵 BGM timing: video_duration={video_duration:.2f}s, "
-                f"start_delay={start_delay:.2f}s, end_delay={end_delay:.2f}s, "
-                f"bgm_play_duration={bgm_play_duration:.2f}s"
+                f"start_delay={bgm_start_time:.2f}s, "
+                f"bgm_play_duration={bgm_play_duration:.2f}s, "
+                f"tail_fade={tail_fade:.2f}s"
             )
 
         # Safety check: if BGM duration is too small or invalid, skip BGM processing
@@ -313,14 +320,21 @@ def ffmpeg_concat_videos(
             return output_path
 
         filter_parts = []
-        if start_delay > 0:
-            delay_ms = int(start_delay * 1000)
-            filter_parts.append(f"adelay={delay_ms}|{delay_ms}")
-
-        # Only trim if we have a valid duration to trim to
+        # 1) Trim desired play window on original BGM stream timeline
         if bgm_play_duration > 0:
             filter_parts.append(f"atrim=duration={bgm_play_duration}")
+            # Normalize PTS to start at 0 after trim for accurate fade timing
+            filter_parts.append("asetpts=PTS-STARTPTS")
+        # 2) Apply natural tail fade-out (if configured)
+        if tail_fade > 0 and bgm_play_duration > 0:
+            fade_d = min(tail_fade, bgm_play_duration)
+            fade_st = max(0.0, bgm_play_duration - fade_d)
+            filter_parts.append(
+                f"afade=t=out:st={fade_st}:d={fade_d}:curve=exp"
+            )
+        # 3) Apply volume after trims/fade
         filter_parts.append(f"volume={bgm_volume_factor}")
+        # 4) No adelay: BGM starts at t=0 by definition
         bgm_filter = ",".join(filter_parts)
         # Compute how many loops of bgm are required to cover desired play duration
         # We will loop the bgm source just enough to exceed bgm_play_duration, then trim
@@ -339,20 +353,24 @@ def ffmpeg_concat_videos(
         if enable_ducking and logger:
             logger.info("🪝 Ducking enabled (sidechaincompress)")
 
+        # Build a padded main audio chain to avoid gaps/silence between segments during mix
+        # [0:a] -> aresample + apad -> [va]
+        main_audio_chain = "[0:a]aresample=async=1:first_pts=0,apad[va]"
         if enable_ducking:
-            # Music as main input, video audio (0:a) as sidechain key
+            # Music as main input, video audio (va) as sidechain key
             filter_complex = (
+                f"{main_audio_chain}; "
                 f"[1:a]{bgm_filter}[bgm]; "
-                # Stronger ducking: lower threshold, higher ratio, faster attack, longer release
-                f"[bgm][0:a]sidechaincompress=threshold=-35dB:ratio=20:attack=5:release=400:knee=8:link=average:level_sc=1:mix=1[bgmsc]; "
-                f"[0:a][bgmsc]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,"
-                f"alimiter=limit=0.95[aout]"
+                f"[bgm][va]sidechaincompress=threshold=-35dB:ratio=20:attack=5:release=400:knee=8:link=average:level_sc=1:mix=1[bgmsc]; "
+                f"[va][bgmsc]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0,"
+                f"alimiter=limit=0.95,aresample=async=1:first_pts=0[aout]"
             )
         else:
             filter_complex = (
+                f"{main_audio_chain}; "
                 f"[1:a]{bgm_filter}[bgm]; "
-                f"[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0,"
-                f"alimiter=limit=0.95[aout]"
+                f"[va][bgm]amix=inputs=2:duration=longest:dropout_transition=2:normalize=0,"
+                f"alimiter=limit=0.95,aresample=async=1:first_pts=0[aout]"
             )
         temp_final_with_bgm = os.path.join(temp_dir, "final_with_bgm.mp4")
         ffmpeg_mix_cmd = [
@@ -376,10 +394,15 @@ def ffmpeg_concat_videos(
                 bgm_path,
                 "-filter_complex",
                 filter_complex,
+                # Normalize video PTS so each concat segment starts at 0 for clean A/V alignment
+                "-vf",
+                "setpts=PTS-STARTPTS",
                 "-map",
                 "0:v",
                 "-map",
                 "[aout]",
+                "-vsync",
+                "2",
                 "-c:v",
                 "libx264",
                 "-profile:v",
